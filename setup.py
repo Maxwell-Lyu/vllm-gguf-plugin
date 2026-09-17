@@ -175,10 +175,6 @@ if _should_build_extension():
         "vllm_gguf_plugin/csrc/torch_bindings.cpp",
         "vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu",
     ]
-    include_dirs = [
-        "vllm_gguf_plugin/csrc",
-        "vllm_gguf_plugin/csrc/gguf",
-    ]
     extra_link_args: list[str] = []
     if not is_rocm:
         sources.extend(
@@ -189,15 +185,30 @@ if _should_build_extension():
             ]
         )
         # Upstream headers take precedence; quoted legacy headers still
-        # resolve next to gguf_kernel.cu.
+        # resolve next to gguf_kernel.cu. All paths must be absolute:
+        # torch's ninja build runs from build/temp*, so relative -I flags
+        # would silently fail to resolve (torch only absolute-izes
+        # compiler.include_dirs, not the per-extension include_dirs).
         include_dirs = [
-            str(UPSTREAM_ROOT / "ggml" / "include"),
-            str(UPSTREAM_ROOT / "ggml" / "src"),
-            str(UPSTREAM_CUDA_ROOT),
-            "vllm_gguf_plugin/csrc/upstream",
-            *include_dirs,
+            str(path.resolve())
+            for path in (
+                UPSTREAM_ROOT / "ggml" / "include",
+                UPSTREAM_ROOT / "ggml" / "src",
+                UPSTREAM_CUDA_ROOT,
+                pathlib.Path("vllm_gguf_plugin/csrc/upstream"),
+                pathlib.Path("vllm_gguf_plugin/csrc"),
+                pathlib.Path("vllm_gguf_plugin/csrc/gguf"),
+            )
         ]
         extra_link_args = ["-Wl,--gc-sections"]
+    else:
+        include_dirs = [
+            str(path.resolve())
+            for path in (
+                pathlib.Path("vllm_gguf_plugin/csrc"),
+                pathlib.Path("vllm_gguf_plugin/csrc/gguf"),
+            )
+        ]
 
     setup_kwargs.update(
         ext_modules=[

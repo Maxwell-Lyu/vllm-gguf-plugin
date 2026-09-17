@@ -70,6 +70,14 @@ def _materialize_upstream_moe_storage_padding(
     param: Parameter | UninitializedParameter,
     weight_type: int,
 ) -> None:
+    """Give a 3D MoE weight the MATRIX_ROW_PADDING storage tail.
+
+    The upstream MoE kernels read up to MATRIX_ROW_PADDING bytes past the
+    logical row end, so the trailing storage must exist even though the
+    logical tensor shape stays unchanged. Called once per MoE layer after
+    all expert weights are loaded; if the loader already preallocated the
+    tail (or padding is not needed) this is a no-op.
+    """
     if (
         torch.version.hip is not None
         or isinstance(param, UninitializedParameter)
@@ -85,11 +93,9 @@ def _materialize_upstream_moe_storage_padding(
         return
 
     data = param.data
-    storage = data.untyped_storage()
     offset_bytes = data.storage_offset() * data.element_size()
-    available_bytes = storage.nbytes() - offset_bytes
     logical_bytes = data.numel() * data.element_size()
-    if available_bytes >= logical_bytes + padding_bytes:
+    if data.untyped_storage().nbytes() >= offset_bytes + logical_bytes + padding_bytes:
         return
 
     padded_storage = torch.empty(

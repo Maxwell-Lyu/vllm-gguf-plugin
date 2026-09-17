@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
 from ..kernel_support import (
+    MOE_NOT_ELIGIBLE_MARKER,
     QuantizationBackend,
     QuantizationOperation,
     supports,
@@ -33,6 +34,7 @@ from .params import (
     GGUFUninitializedWeightTypeParameter,
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
+    _materialize_upstream_moe_storage_padding,
 )
 from .utils import logger
 
@@ -148,7 +150,10 @@ def _fused_moe_gguf(
             ops.moe_sum(out, out_hidden_states)
             return out_hidden_states
         except RuntimeError as error:
-            if moe_mode != "auto" or "upstream MoE is not eligible" not in str(error):
+            # The upstream op embeds MOE_NOT_ELIGIBLE_MARKER (defined in both
+            # kernel_support.py and bridge.cu) when the inputs cannot run on
+            # the upstream MoE kernel; auto mode may then fall back.
+            if moe_mode != "auto" or MOE_NOT_ELIGIBLE_MARKER not in str(error):
                 raise
             if upstream_only_types:
                 raise RuntimeError(
@@ -346,6 +351,21 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         )
         set_weight_attrs(w2_weight_type, extra_weight_attrs)
         layer.register_parameter("w2_weight_type", w2_weight_type)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Reserve the upstream MATRIX_ROW_PADDING storage tail on MoE weights.
+
+        Runs after every expert shard is loaded. The upstream MoE kernels
+        validate the trailing storage at launch time, and the per-shard
+        loader only pads 2D dense weights, so the 3D MoE parameters are
+        padded here using each parameter's quantization type.
+        """
+        _materialize_upstream_moe_storage_padding(
+            layer.w13_weight, layer.w13_weight_type.weight_type
+        )
+        _materialize_upstream_moe_storage_padding(
+            layer.w2_weight, layer.w2_weight_type.weight_type
+        )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
