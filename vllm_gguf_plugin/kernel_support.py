@@ -235,7 +235,16 @@ KQUANT_TYPES = frozenset(_types("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"))
 IMATRIX_QUANT_TYPES = frozenset(_IQ_TYPES)
 
 _UPSTREAM_STORAGE_TYPES = CUDA_UPSTREAM_MMVQ_TYPES | CUDA_UPSTREAM_MMQ_TYPES
+
+# Must match the upstream MATRIX_ROW_PADDING macro (common.cuh); bridge.cu
+# static-asserts the C++ side stays a multiple of this value.
 _MATRIX_ROW_PADDING = 512
+
+# Stable error-message marker emitted by csrc/upstream/bridge.cu whenever the
+# upstream MoE kernel cannot run its inputs. fused_moe.py matches on this to
+# decide whether auto mode may fall back to the legacy/Triton MoE path. Both
+# sides must change together.
+MOE_NOT_ELIGIBLE_MARKER = "VLLM_GGUF_MOE_NOT_ELIGIBLE"
 
 
 def upstream_storage_padding_bytes(weight_type: int, packed_row_size: int) -> int:

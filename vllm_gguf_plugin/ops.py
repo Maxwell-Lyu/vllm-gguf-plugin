@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import typing
 
 import torch
 
@@ -20,6 +21,11 @@ from .triton.dequantize.interface import ggml_dequantize_triton
 from .triton.fused_moe.interface import ggml_moe_a8_triton
 from .triton.fused_moe.utils import get_triton_moe_block_m
 from .triton.gemm.interface import ggml_mul_mat_a8_triton
+
+# Public re-exports: tests and external consumers reference
+# `ops.GGML_TYPE_*` as stable numeric constants, so keep them importable
+# from this module even though backend capability tables now live in
+# kernel_support.py.
 from .triton.gemm.utils import (  # noqa: F401
     GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ1_S,
@@ -89,7 +95,7 @@ def cuda_dequantize_kernel_mode() -> str:
 
 
 def cuda_kernel_mode() -> str:
-    """Backward-compatible alias for the dense selector."""
+    """Alias for :func:`cuda_dense_kernel_mode` (public selector API)."""
     return cuda_dense_kernel_mode()
 
 
@@ -102,7 +108,7 @@ def cuda_dense_upstream_enabled() -> bool:
 
 
 def cuda_upstream_enabled() -> bool:
-    """Backward-compatible alias for dense upstream availability."""
+    """Alias for :func:`cuda_dense_upstream_enabled` (public selector API)."""
     return cuda_dense_upstream_enabled()
 
 
@@ -288,7 +294,9 @@ def _cuda_upstream_supports(
     )
 
 
-def _raise_backend_unavailable(backend: str, operation: str, quant_type: int):
+def _raise_backend_unavailable(
+    backend: str, operation: str, quant_type: int
+) -> typing.NoReturn:
     raise RuntimeError(
         f"{backend} {operation} backend is unavailable for quantization type "
         f"{quant_type}"

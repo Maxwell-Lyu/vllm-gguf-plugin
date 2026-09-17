@@ -33,9 +33,20 @@ Tensor ggml_mul_mat_a8_legacy(Tensor W, Tensor X, int64_t type, int64_t row);
 
 namespace {
 
-constexpr int64_t kMatrixRowPadding = 512;
+// Authoritative value comes from the upstream common.cuh macro; keep this
+// alias so a future upstream change only needs this line updated (guarded
+// against drift by the static_assert below).
+constexpr int64_t kMatrixRowPadding = MATRIX_ROW_PADDING;
+static_assert(MATRIX_ROW_PADDING % 512 == 0,
+              "Python kernel_support.py assumes a 512-value row padding");
 constexpr int64_t kQK8_1 = 32;
 constexpr int64_t kMmvqMaxBatchSize = 8;
+
+// Stable marker embedded in every "cannot run the upstream MoE kernel"
+// error message. kernel_support.py exposes this constant and fused_moe.py
+// matches on it to decide whether auto mode may fall back. Do not reword
+// the marker without updating both sides.
+constexpr const char* kMoeNotEligibleMarker = "VLLM_GGUF_MOE_NOT_ELIGIBLE";
 
 enum class KernelMode { kAuto, kUpstream, kLegacy, kTriton };
 
@@ -80,7 +91,10 @@ void check_common_inputs(const Tensor& W, const Tensor& X, int64_t row,
                   ": row must be in (0, W.size(0)]");
 }
 
-bool is_upstream_mmvq_type(int64_t type) {
+// The full set of quantization types the upstream CUDA kernels handle. Named
+// "upstream" (not "upstream MMVQ") because dequantize/MMQ/MoE eligibility all
+// derive from it.
+bool is_upstream_type(int64_t type) {
   switch (type) {
     case GGML_TYPE_Q4_0:
     case GGML_TYPE_Q4_1:
@@ -112,25 +126,44 @@ bool is_upstream_mmvq_type(int64_t type) {
 }
 
 bool is_legacy_mmvq_type(int64_t type) {
+  // Explicit whitelist mirroring kernel_support.py's LEGACY MMVQ set. Do NOT
+  // derive this from is_upstream_type by exclusion: a new upstream type
+  // would then be wrongly reported as legacy-capable while gguf_kernel.cu's
+  // fixed switch has no instance for it.
   switch (type) {
-    case GGML_TYPE_Q1_0:
-    case GGML_TYPE_Q2_0:
-    case GGML_TYPE_MXFP4:
-    case GGML_TYPE_NVFP4:
-      return false;
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q4_1:
+    case GGML_TYPE_Q5_0:
+    case GGML_TYPE_Q5_1:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_Q2_K:
+    case GGML_TYPE_Q3_K:
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_Q5_K:
+    case GGML_TYPE_Q6_K:
+    case GGML_TYPE_IQ2_XXS:
+    case GGML_TYPE_IQ2_XS:
+    case GGML_TYPE_IQ3_XXS:
+    case GGML_TYPE_IQ1_S:
+    case GGML_TYPE_IQ4_NL:
+    case GGML_TYPE_IQ3_S:
+    case GGML_TYPE_IQ2_S:
+    case GGML_TYPE_IQ4_XS:
+    case GGML_TYPE_IQ1_M:
+      return true;
     default:
-      return is_upstream_mmvq_type(type);
+      return false;
   }
 }
 
 int64_t block_size_for_type(int64_t type, const char* op_name) {
-  STD_TORCH_CHECK(is_upstream_mmvq_type(type), op_name,
+  STD_TORCH_CHECK(is_upstream_type(type), op_name,
                   ": unsupported upstream MMVQ quantization type: ", type);
   return ggml_blck_size(static_cast<ggml_type>(type));
 }
 
 size_t type_size_for_type(int64_t type, const char* op_name) {
-  STD_TORCH_CHECK(is_upstream_mmvq_type(type), op_name,
+  STD_TORCH_CHECK(is_upstream_type(type), op_name,
                   ": unsupported upstream MMVQ quantization type: ", type);
   return ggml_type_size(static_cast<ggml_type>(type));
 }
@@ -381,44 +414,52 @@ void check_moe_inputs(const Tensor& X, const Tensor& W, const Tensor& topk_ids,
                       int64_t type, int64_t row, int64_t top_k,
                       int64_t tokens) {
   STD_TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: all "
+                  kMoeNotEligibleMarker,
+                  ": all "
                   "tensors must be CUDA tensors");
   STD_TORCH_CHECK(X.get_device_index() == W.get_device_index() &&
                       X.get_device_index() == topk_ids.get_device_index(),
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+                  kMoeNotEligibleMarker,
+                  ": "
                   "tensors must be on the same CUDA device");
   STD_TORCH_CHECK(X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+                  kMoeNotEligibleMarker,
+                  ": "
                   "expected X[ tokens, K ], W[ experts, rows, packed ], and "
                   "topk_ids[ tokens, top_k ]");
   STD_TORCH_CHECK(
       X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous(),
-      "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+      kMoeNotEligibleMarker,
+      ": "
       "tensors must be contiguous");
   STD_TORCH_CHECK(topk_ids.scalar_type() == ScalarType::Int,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+                  kMoeNotEligibleMarker,
+                  ": "
                   "topk_ids must be int32");
   STD_TORCH_CHECK(X.scalar_type() == ScalarType::Float ||
                       X.scalar_type() == ScalarType::Half ||
                       X.scalar_type() == ScalarType::BFloat16,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: X "
+                  kMoeNotEligibleMarker,
+                  ": X "
                   "must have dtype fp32, fp16, or bf16");
-  STD_TORCH_CHECK(W.element_size() == 1,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: W "
+  STD_TORCH_CHECK(W.element_size() == 1, kMoeNotEligibleMarker,
+                  ": W "
                   "must contain packed byte data");
-  STD_TORCH_CHECK(is_upstream_mmvq_type(type),
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+  STD_TORCH_CHECK(is_upstream_type(type), kMoeNotEligibleMarker,
+                  ": "
                   "unsupported quantization type ",
                   type);
-  STD_TORCH_CHECK(tokens > 0 && top_k > 0 && row > 0,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+  STD_TORCH_CHECK(tokens > 0 && top_k > 0 && row > 0, kMoeNotEligibleMarker,
+                  ": "
                   "tokens, top_k, and row must be positive");
   STD_TORCH_CHECK(X.size(0) == tokens && topk_ids.size(0) == tokens &&
                       topk_ids.size(1) == top_k,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+                  kMoeNotEligibleMarker,
+                  ": "
                   "shape arguments do not match X/topk_ids");
   STD_TORCH_CHECK(W.size(0) > 0 && W.size(1) == row && W.size(2) > 0,
-                  "ggml_moe_a8_upstream: upstream MoE is not eligible: "
+                  kMoeNotEligibleMarker,
+                  ": "
                   "shape arguments do not match W");
 }
 
@@ -464,10 +505,10 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
     const bool fallback = row % 128 != 0;
     const int j_max = ggml_cuda_mmq_get_J_max(static_cast<ggml_type>(type),
                                               fallback, cc, tokens);
-    STD_TORCH_CHECK(
-        is_upstream_mmq_type(type) && j_max > 0,
-        "ggml_moe_a8_upstream: upstream MoE is not eligible: no MMQ "
-        "configuration for type/shape/device");
+    STD_TORCH_CHECK(is_upstream_mmq_type(type) && j_max > 0,
+                    kMoeNotEligibleMarker,
+                    ": no MMQ "
+                    "configuration for type/shape/device");
     ggml_cuda_mul_mat_q(context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMQ");
   }
@@ -591,12 +632,12 @@ void run_upstream_dequantize(const Tensor& W, Tensor& output, int64_t type,
 
 bool upstream_mmvq_eligible(const Tensor& W, const Tensor& X, int64_t type,
                             int64_t k) {
-  return is_upstream_mmvq_type(type) && X.size(0) <= kMmvqMaxBatchSize &&
+  return is_upstream_type(type) && X.size(0) <= kMmvqMaxBatchSize &&
          has_weight_padding(W, k, type, "ggml_mul_mat_vec_a8");
 }
 
 bool is_upstream_mmq_type(int64_t type) {
-  return is_upstream_mmvq_type(type) && type != GGML_TYPE_IQ1_M;
+  return is_upstream_type(type) && type != GGML_TYPE_IQ1_M;
 }
 
 bool is_legacy_mmq_type(int64_t type) {
@@ -638,7 +679,7 @@ Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
                   "non-negative");
   STD_TORCH_CHECK(m == 0 || n <= std::numeric_limits<int64_t>::max() / m,
                   "ggml_dequantize_upstream: output dimensions overflow");
-  STD_TORCH_CHECK(is_upstream_mmvq_type(type),
+  STD_TORCH_CHECK(is_upstream_type(type),
                   "ggml_dequantize_upstream: unsupported quantization type ",
                   type);
 
@@ -690,14 +731,13 @@ Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                             int64_t row, int64_t top_k, int64_t tokens) {
   check_moe_inputs(X, W, topk_ids, type, row, top_k, tokens);
   const int64_t k = logical_k_from_moe_weight(W, type, "ggml_moe_a8_upstream");
-  STD_TORCH_CHECK(
-      X.size(1) == k,
-      "ggml_moe_a8_upstream: upstream MoE is not eligible: X K dimension "
-      "does not match the packed expert row");
-  STD_TORCH_CHECK(
-      has_weight_padding(W, k, type, "ggml_moe_a8_upstream"),
-      "ggml_moe_a8_upstream: upstream MoE is not eligible: W lacks required "
-      "MATRIX_ROW_PADDING storage");
+  STD_TORCH_CHECK(X.size(1) == k, kMoeNotEligibleMarker,
+                  ": X K dimension "
+                  "does not match the packed expert row");
+  STD_TORCH_CHECK(has_weight_padding(W, k, type, "ggml_moe_a8_upstream"),
+                  kMoeNotEligibleMarker,
+                  ": W lacks required "
+                  "MATRIX_ROW_PADDING storage");
   return run_upstream_moe_projection(W, X, topk_ids, type, row, top_k, tokens);
 }
 
@@ -721,7 +761,7 @@ Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
   }
   if (mode == KernelMode::kUpstream) {
     STD_TORCH_CHECK(
-        is_upstream_mmvq_type(type),
+        is_upstream_type(type),
         "ggml_mul_mat_vec_a8: no upstream MMVQ kernel for quantization type ",
         type);
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
@@ -734,7 +774,7 @@ Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
     return run_upstream_mmvq(W, X, type, row, k);
   }
 
-  if (is_upstream_mmvq_type(type)) {
+  if (is_upstream_type(type)) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_vec_a8: X K dimension does not match W");
