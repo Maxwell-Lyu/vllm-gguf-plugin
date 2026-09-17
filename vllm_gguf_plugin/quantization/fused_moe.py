@@ -22,13 +22,19 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
+from ..kernel_support import (
+    QuantizationBackend,
+    QuantizationOperation,
+    supports,
+    supports_moe,
+)
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
 )
-from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+from .utils import logger
 
 
 def _fused_moe_gguf(
@@ -53,9 +59,106 @@ def _fused_moe_gguf(
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
     out_hidden_states = torch.empty_like(x)
+    moe_mode = ops.cuda_moe_kernel_mode()
+    upstream_types = supports_moe(
+        weight_type, QuantizationBackend.UPSTREAM
+    ) and supports_moe(weight_type2, QuantizationBackend.UPSTREAM)
+    upstream_available = (
+        upstream_types
+        and ops.cuda_moe_upstream_kernel_available(weight_type)
+        and ops.cuda_moe_upstream_kernel_available(weight_type2)
+    )
+    upstream_only_types = (
+        supports(
+            weight_type,
+            QuantizationBackend.UPSTREAM,
+            QuantizationOperation.DEQUANTIZE,
+        )
+        and not supports(
+            weight_type, QuantizationBackend.LEGACY, QuantizationOperation.MMVQ
+        )
+    ) or (
+        supports(
+            weight_type2,
+            QuantizationBackend.UPSTREAM,
+            QuantizationOperation.DEQUANTIZE,
+        )
+        and not supports(
+            weight_type2, QuantizationBackend.LEGACY, QuantizationOperation.MMVQ
+        )
+    )
+
+    def fallback_supports(quant_type: int, operation: QuantizationOperation) -> bool:
+        if moe_mode == "legacy":
+            return supports(quant_type, QuantizationBackend.LEGACY, operation)
+        if moe_mode == "triton":
+            return supports(quant_type, QuantizationBackend.TRITON, operation)
+        return supports(quant_type, QuantizationBackend.LEGACY, operation) or supports(
+            quant_type, QuantizationBackend.TRITON, operation
+        )
+
+    if moe_mode == "upstream" and not upstream_available:
+        raise RuntimeError(
+            "upstream MoE CUDA kernel is unavailable for the selected "
+            "quantization types or build"
+        )
+    if moe_mode == "legacy" and upstream_only_types:
+        raise RuntimeError(
+            "legacy MoE mode cannot handle upstream-only quantization types"
+        )
     if (
-        weight_type2 in MMQ_QUANT_TYPES
-        and weight_type in MMQ_QUANT_TYPES
+        moe_mode in {"auto", "triton"}
+        and not upstream_available
+        and upstream_only_types
+    ):
+        raise RuntimeError(
+            "upstream-only quantization types require the upstream MoE CUDA "
+            "kernel; no legacy/Triton fallback is available"
+        )
+    if moe_mode == "triton" and not all(
+        fallback_supports(quant_type, QuantizationOperation.MMVQ)
+        or fallback_supports(quant_type, QuantizationOperation.MMQ)
+        for quant_type in (weight_type, weight_type2)
+    ):
+        raise RuntimeError(
+            "triton MoE backend is unavailable for the selected quantization types"
+        )
+    if moe_mode in {"upstream", "auto"} and upstream_available:
+        num_tokens, _ = x.shape
+        _, N, _ = w1.shape
+        top_k = topk_ids.shape[1]
+        try:
+            out = ops.ggml_moe_a8_upstream(
+                x, w1, topk_ids, weight_type, N, top_k, num_tokens
+            )
+            out = act(out)
+            flat_topk_ids = topk_ids.reshape(-1, 1)
+            out = ops.ggml_moe_a8_upstream(
+                out,
+                w2,
+                flat_topk_ids,
+                weight_type2,
+                w2.shape[1],
+                1,
+                num_tokens * top_k,
+            )
+            out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
+                topk_weights.view(num_tokens, top_k, 1)
+            )
+            ops.moe_sum(out, out_hidden_states)
+            return out_hidden_states
+        except RuntimeError as error:
+            if moe_mode != "auto" or "upstream MoE is not eligible" not in str(error):
+                raise
+            if upstream_only_types:
+                raise RuntimeError(
+                    "upstream-only quantization types cannot fall back from "
+                    "the upstream MoE CUDA kernel"
+                ) from error
+
+    if (
+        fallback_supports(weight_type2, QuantizationOperation.MMQ)
+        and fallback_supports(weight_type, QuantizationOperation.MMQ)
         and x.shape[0] > 64
     ):
         num_tokens, _ = x.shape
@@ -93,7 +196,9 @@ def _fused_moe_gguf(
             topk_weights.view(num_tokens, top_k, 1)
         )
         ops.moe_sum(out, out_hidden_states)
-    elif weight_type2 in MMVQ_QUANT_TYPES and weight_type in MMVQ_QUANT_TYPES:
+    elif fallback_supports(
+        weight_type2, QuantizationOperation.MMVQ
+    ) and fallback_supports(weight_type, QuantizationOperation.MMVQ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
