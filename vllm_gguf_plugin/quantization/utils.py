@@ -7,9 +7,13 @@ from types import MappingProxyType
 from vllm.logger import init_logger
 
 from ..kernel_support import (
+    IMATRIX_QUANT_TYPES,
+    KQUANT_TYPES,
+    STANDARD_QUANT_TYPES,
     TRITON_DEQUANT_TYPES,
     TRITON_MMQ_TYPES,
     TRITON_MMVQ_TYPES,
+    UNQUANTIZED_TYPES,
 )
 
 logger = init_logger(__name__)
@@ -54,3 +58,13 @@ def is_layer_skipped_gguf(
 DEQUANT_TYPES = TRITON_DEQUANT_TYPES
 MMVQ_QUANT_TYPES = TRITON_MMVQ_TYPES
 MMQ_QUANT_TYPES = TRITON_MMQ_TYPES
+
+__all__ = [
+    "DEQUANT_TYPES",
+    "IMATRIX_QUANT_TYPES",
+    "KQUANT_TYPES",
+    "MMQ_QUANT_TYPES",
+    "MMVQ_QUANT_TYPES",
+    "STANDARD_QUANT_TYPES",
+    "UNQUANTIZED_TYPES",
+]
