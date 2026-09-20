@@ -227,14 +227,29 @@ void check_launch(const char* op_name) {
                   ": CUDA launch failed: ", cudaGetErrorString(error));
 }
 
+// Extra bytes handed out with every pool allocation. The upstream MMQ kernels
+// assume the ggml_cuda_pool hands back chunks carved from larger aligned
+// blocks, so tile loads can read a few bytes past the requested size (the
+// caller-side J_max guard undercounts when src1 is a broadcast view with
+// ne11 == 1, which is exactly how the bridge builds the MoE activation
+// tensor). Returning exactly `size` bytes made those reads out-of-bounds,
+// surfacing as NaN outputs or illegal memory accesses depending on where the
+// trailing tile landed. 128 blocks of block_q8_1_mmq is the largest J the
+// mmq config tables select, so this tail fully covers any J_best guard.
+// The tail must be zeroed, not merely allocated: mul_mat_q reads full J-row
+// tiles whose trailing rows lie past the logical data (write-back masks them
+// out by j_max), and garbage scale bytes in that tail occasionally poisoned
+// results non-deterministically.
+constexpr size_t kPoolGuardTailBytes = 128 * sizeof(block_q8_1_mmq);
+
 class TorchScratchPool final : public ggml_cuda_pool {
  public:
   explicit TorchScratchPool(const Tensor& prototype) : prototype_(prototype) {}
 
   void* alloc(size_t size, size_t* actual_size) override {
-    const size_t bytes = std::max<size_t>(size, 1);
+    const size_t bytes = std::max<size_t>(size, 1) + kPoolGuardTailBytes;
     const int64_t int_count = static_cast<int64_t>((bytes + 3) / 4);
-    owners_.push_back(torch::stable::new_empty(
+    owners_.push_back(torch::stable::new_zeros(
         prototype_, {int_count}, std::optional<ScalarType>(ScalarType::Int)));
     *actual_size = static_cast<size_t>(int_count) * 4;
     return owners_.back().data_ptr();
