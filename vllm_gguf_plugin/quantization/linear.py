@@ -49,13 +49,15 @@ def _fused_mul_mat_gguf(
         weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.MMVQ
     )
     if upstream_mmvq:
-        mmvq_safe = 8
-    elif weight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 8 if weight.shape[0] > 5120 else 16
+        use_mmvq = ops.should_use_upstream_mmvq(x, weight_type)
     else:
-        mmvq_safe = 2 if weight.shape[0] > 5120 else 6
+        if weight_type in IMATRIX_QUANT_TYPES:
+            mmvq_safe = 8 if weight.shape[0] > 5120 else 16
+        else:
+            mmvq_safe = 2 if weight.shape[0] > 5120 else 6
+        use_mmvq = x.shape[0] <= mmvq_safe
 
-    if x.shape[0] <= mmvq_safe and (weight_type in MMVQ_QUANT_TYPES or upstream_mmvq):
+    if use_mmvq and (weight_type in MMVQ_QUANT_TYPES or upstream_mmvq):
         return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
     upstream_mmq = ops.cuda_dense_upstream_enabled() and supports(
         weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.MMQ

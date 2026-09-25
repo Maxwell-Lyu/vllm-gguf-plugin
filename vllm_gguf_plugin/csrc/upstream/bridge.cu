@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/ops.h>
 
@@ -37,10 +38,17 @@ namespace {
 // alias so a future upstream change only needs this line updated (guarded
 // against drift by the static_assert below).
 constexpr int64_t kMatrixRowPadding = MATRIX_ROW_PADDING;
-static_assert(MATRIX_ROW_PADDING % 512 == 0,
-              "Python kernel_support.py assumes a 512-value row padding");
+// Python kernel_support.py hard-codes 512 (see _MATRIX_ROW_PADDING) and the
+// test helpers mirror it. A multiple-of-512 assertion would let an upstream
+// bump to e.g. 1024 pass here while Python under-allocates weight storage,
+// so require exact equality and force both sides to move together.
+static_assert(MATRIX_ROW_PADDING == 512,
+              "Python kernel_support.py assumes a 512-value row padding; "
+              "update _MATRIX_ROW_PADDING and tests/helpers_upstream.py "
+              "together with any upstream MATRIX_ROW_PADDING change");
 constexpr int64_t kQK8_1 = 32;
-constexpr int64_t kMmvqMaxBatchSize = 8;
+// Kernel launch limit, distinct from the architecture-tuned dispatch policy.
+constexpr int64_t kMmvqMaxBatchSize = MMVQ_MAX_BATCH_SIZE;
 
 // Stable marker embedded in every "cannot run the upstream MoE kernel"
 // error message. kernel_support.py exposes this constant and fused_moe.py
@@ -185,8 +193,7 @@ size_t storage_padding_bytes(int64_t k, int64_t type, const char* op_name) {
 bool has_weight_padding(const Tensor& W, int64_t k, int64_t type,
                         const char* op_name) {
   int64_t storage_size = 0;
-  STABLE_TORCH_ERROR_CODE_CHECK(
-      aoti_torch_get_storage_size(W.get(), &storage_size));
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_storage_size(W.get(), &storage_size));
   const size_t element_size = W.element_size();
   const size_t offset_bytes =
       static_cast<size_t>(W.storage_offset()) * element_size;
@@ -200,25 +207,66 @@ bool has_weight_padding(const Tensor& W, int64_t k, int64_t type,
          logical_bytes + storage_padding_bytes(k, type, op_name);
 }
 
-int64_t logical_k_from_weight(const Tensor& W, int64_t type,
-                              const char* op_name) {
+// Shared body of the packed-row -> logical-k derivation. packed_row_bytes is
+// the per-row packed byte count (W.size(1) for dense, W.size(2) for MoE); the
+// wrappers keep their operation-specific error text.
+int64_t logical_k_from_packed_row_bytes(int64_t packed_row_bytes, int64_t type,
+                                        const char* op_name,
+                                        const char* row_desc) {
   const size_t type_size = type_size_for_type(type, op_name);
   const int64_t block_size = block_size_for_type(type, op_name);
-  STD_TORCH_CHECK(W.size(1) > 0 && W.size(1) % type_size == 0, op_name,
-                  ": packed row size is not a multiple of the quantization "
-                  "type size");
-  return W.size(1) / static_cast<int64_t>(type_size) * block_size;
+  STD_TORCH_CHECK(packed_row_bytes > 0 && packed_row_bytes % type_size == 0,
+                  op_name, ": packed ", row_desc,
+                  " size is not a multiple of the quantization type size");
+  return packed_row_bytes / static_cast<int64_t>(type_size) * block_size;
+}
+
+int64_t logical_k_from_weight(const Tensor& W, int64_t type,
+                              const char* op_name) {
+  return logical_k_from_packed_row_bytes(W.size(1), type, op_name, "row");
 }
 
 int64_t padded_k(int64_t k) {
   return (k + kMatrixRowPadding - 1) / kMatrixRowPadding * kMatrixRowPadding;
 }
 
+// The upstream context's stream() helper lazily creates a private
+// cudaStreamNonBlocking stream whenever it observes a null slot. The bridge
+// must never let that happen: all bridge-owned work (dtype casts, quantize,
+// zeroing) runs on the Torch current stream, so upstream kernels launched
+// through ctx.stream() have to observe the same underlying stream or reads
+// and writes race with no ordering dependency.
+//
+// Torch's default stream reports a null handle. Upstream treats null as
+// "not created", so a raw assignment would silently keep the private-stream
+// behavior. Normalize instead to CUDA's special non-null handles, which map
+// to the same underlying default stream the null handle denotes.
+// setup.py does not compile with --default-stream per-thread, so the legacy
+// default-stream semantics apply for this build; keep both mappings in one
+// place in case that flag ever changes.
+cudaStream_t normalize_borrowed_stream(cudaStream_t stream) {
+  return stream != nullptr ? stream : cudaStreamLegacy;
+}
+
+// Install the borrowed Torch current stream into the per-call GGML context.
+// The context destructor does not destroy borrowed streams (see
+// runtime_adapter.cu), and the pool/scratch owner relies on the Torch
+// caching allocator's same-stream ordering, so all allocations and kernels
+// must stay on this one stream.
+cudaStream_t current_stream(int32_t device_index);
+
+void bind_torch_stream_to_context(ggml_backend_cuda_context& context,
+                                  int32_t device_index) {
+  const cudaStream_t stream = current_stream(device_index);
+  context.streams[device_index][0] = stream;
+  context.curr_stream_no = 0;
+}
+
 cudaStream_t current_stream(int32_t device_index) {
   void* raw_stream = nullptr;
   TORCH_ERROR_CODE_CHECK(
       aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
-  return static_cast<cudaStream_t>(raw_stream);
+  return normalize_borrowed_stream(static_cast<cudaStream_t>(raw_stream));
 }
 
 void check_launch(const char* op_name) {
@@ -234,20 +282,57 @@ void check_launch(const char* op_name) {
 // ne11 == 1, which is exactly how the bridge builds the MoE activation
 // tensor). Returning exactly `size` bytes made those reads out-of-bounds,
 // surfacing as NaN outputs or illegal memory accesses depending on where the
-// trailing tile landed. 128 blocks of block_q8_1_mmq is the largest J the
-// mmq config tables select, so this tail fully covers any J_best guard.
-// The tail must be zeroed, not merely allocated: mul_mat_q reads full J-row
-// tiles whose trailing rows lie past the logical data (write-back masks them
-// out by j_max), and garbage scale bytes in that tail occasionally poisoned
-// results non-deterministically.
-constexpr size_t kPoolGuardTailBytes = 128 * sizeof(block_q8_1_mmq);
+// trailing tile landed. The tail must be zeroed, not merely allocated:
+// mul_mat_q reads full J-row tiles whose trailing rows lie past the logical
+// data (write-back masks them out by j_max), and garbage scale bytes in that
+// tail occasionally poisoned results non-deterministically.
+//
+// kMmqTileColumnsMax mirrors mul_mat_q_switch_J, which scans J from 8 to 128
+// (its tile-column upper bound), so a tail of one row of the largest selected
+// tile covers any J_best guard. This is deliberately NOT derived from
+// MATRIX_ROW_PADDING (that guards the K dimension, not J). sizeof stays a
+// run-time sizeof(block_q8_1_mmq): upstream static-asserts block_fp4_mmq has
+// the same size, so one tail formula covers the Q8 and native-FP4 layouts.
+constexpr int kMmqTileColumnsMax = 128;
+constexpr size_t kPoolGuardTailBytes =
+    static_cast<size_t>(kMmqTileColumnsMax) * sizeof(block_q8_1_mmq);
 
+// The pool exposes two entry points with different guard policies:
+//
+//  - alloc() (the ggml_cuda_pool virtual override): every upstream
+//    ggml_cuda_pool_alloc goes through here, and the interface carries only a
+//    byte count - no buffer purpose. Upstream callers (mmvq.cu / mmq.cu
+//    quantized activations, ids_src1/ids_dst/expert_bounds, NVFP4 src1_scale,
+//    stream-k tmp_fixup) have heterogeneous tile-read patterns and their own
+//    J_max guard undercounts for broadcast views (ne11 == 1), so the
+//    conservative zeroed tail stays. Compatibility-layer policy for the
+//    pinned upstream (002a12ad); do not shrink without per-buffer proofs.
+//
+//  - alloc_workspace(): bridge-owned workspace allocations only (dense
+//    buffers). The caller knows the exact layout and already reserves every
+//    needed guard explicitly (the Q8 region includes the j_max tile guard in
+//    q8_bytes), so no extra tail is appended - protection lives at the
+//    correct interior offset instead of being duplicated at the block end.
+//    The dense workspace must never contain ids/scale/fixup data; those are
+//    allocated by upstream itself via the virtual entry, where the tail
+//    still applies.
 class TorchScratchPool final : public ggml_cuda_pool {
  public:
   explicit TorchScratchPool(const Tensor& prototype) : prototype_(prototype) {}
 
   void* alloc(size_t size, size_t* actual_size) override {
-    const size_t bytes = std::max<size_t>(size, 1) + kPoolGuardTailBytes;
+    return alloc_impl(std::max<size_t>(size, 1) + kPoolGuardTailBytes,
+                      actual_size);
+  }
+
+  void* alloc_workspace(size_t bytes, size_t* actual_size) {
+    return alloc_impl(bytes, actual_size);
+  }
+
+  void free(void* /*ptr*/, size_t /*size*/) override {}
+
+ private:
+  void* alloc_impl(size_t bytes, size_t* actual_size) {
     const int64_t int_count = static_cast<int64_t>((bytes + 3) / 4);
     owners_.push_back(torch::stable::new_zeros(
         prototype_, {int_count}, std::optional<ScalarType>(ScalarType::Int)));
@@ -255,9 +340,6 @@ class TorchScratchPool final : public ggml_cuda_pool {
     return owners_.back().data_ptr();
   }
 
-  void free(void* /*ptr*/, size_t /*size*/) override {}
-
- private:
   const Tensor& prototype_;
   std::vector<Tensor> owners_;
 };
@@ -269,8 +351,20 @@ struct DenseBuffers {
   float* result;
 };
 
+// Hand the scratch pool to the context's pool slot. Ownership transfers to
+// the context's unique_ptr<ggml_cuda_pool>: the pool lives exactly as long
+// as the per-call context, which outlives every allocation and kernel in the
+// runner (the pool is destroyed only after the context is). This keeps
+// ctx.pool() resolving the live object without any double-free risk - the
+// runner must not keep a second owning pointer to the same pool.
+void install_scratch_pool(ggml_backend_cuda_context& context,
+                          int32_t device_index,
+                          std::unique_ptr<TorchScratchPool>& pool) {
+  context.pools[device_index][0] = std::move(pool);
+}
+
 DenseBuffers dense_buffers(const Tensor& X, int64_t output_rows, int64_t row,
-                           size_t q8_bytes, ggml_backend_cuda_context& context,
+                           size_t q8_bytes, TorchScratchPool& scratch_pool,
                            cudaStream_t stream) {
   Tensor output =
       torch::stable::new_empty(X, {output_rows, row}, X.scalar_type());
@@ -281,10 +375,20 @@ DenseBuffers dense_buffers(const Tensor& X, int64_t output_rows, int64_t row,
   const size_t result_offset = input_offset + align(input_bytes);
   const size_t result_bytes = cast ? output_rows * row * sizeof(float) : 0;
   size_t actual_size = 0;
-  // All temporary regions have one per-call Torch owner. 256-byte alignment
-  // preserves the upstream quantizer's vector loads and graph/stream safety.
-  auto* scratch = static_cast<char*>(
-      context.pool().alloc(result_offset + result_bytes, &actual_size));
+  // fp32 input with no bridge-owned quantized region needs no scratch at all:
+  // input comes straight from X and the result goes straight into the output
+  // tensor. Skip the allocation instead of handing back a pointer that is
+  // only used for pointer arithmetic that never dereferences.
+  const bool need_scratch = cast || q8_bytes > 0;
+  // All temporary regions have one per-call Torch owner. The workspace entry
+  // adds no tail: every guard the layout needs is already part of q8_bytes.
+  // 256-byte alignment preserves the upstream quantizer's vector loads and
+  // graph/stream safety.
+  char* scratch = nullptr;
+  if (need_scratch) {
+    scratch = static_cast<char*>(scratch_pool.alloc_workspace(
+        result_offset + result_bytes, &actual_size));
+  }
   const float* input = cast ? reinterpret_cast<float*>(scratch + input_offset)
                             : static_cast<const float*>(X.data_ptr());
   float* result = cast ? reinterpret_cast<float*>(scratch + result_offset)
@@ -331,34 +435,30 @@ ggml_tensor make_quant_tensor(const Tensor& W, int64_t type, int64_t k,
   return tensor;
 }
 
-ggml_tensor make_f32_tensor(const float* data, int64_t k, int64_t batch) {
+// Contiguous two-dimensional F32 descriptor shared by the activation (ne[0]
+// = row length) and output (ne[0] = row count) constructions; the thin
+// wrappers keep their call-site semantics readable.
+ggml_tensor make_f32_tensor_2d(const void* data, int64_t ne0, int64_t ne1) {
   ggml_tensor tensor{};
   tensor.type = GGML_TYPE_F32;
-  tensor.ne[0] = k;
-  tensor.ne[1] = batch;
+  tensor.ne[0] = ne0;
+  tensor.ne[1] = ne1;
   tensor.ne[2] = 1;
   tensor.ne[3] = 1;
   tensor.nb[0] = sizeof(float);
-  tensor.nb[1] = static_cast<size_t>(k) * sizeof(float);
-  tensor.nb[2] = tensor.nb[1] * static_cast<size_t>(batch);
+  tensor.nb[1] = static_cast<size_t>(ne0) * sizeof(float);
+  tensor.nb[2] = tensor.nb[1] * static_cast<size_t>(ne1);
   tensor.nb[3] = tensor.nb[2];
-  tensor.data = const_cast<float*>(data);
+  tensor.data = const_cast<void*>(data);
   return tensor;
 }
 
+ggml_tensor make_f32_tensor(const float* data, int64_t k, int64_t batch) {
+  return make_f32_tensor_2d(data, k, batch);
+}
+
 ggml_tensor make_output_tensor(float* data, int64_t row, int64_t batch) {
-  ggml_tensor tensor{};
-  tensor.type = GGML_TYPE_F32;
-  tensor.ne[0] = row;
-  tensor.ne[1] = batch;
-  tensor.ne[2] = 1;
-  tensor.ne[3] = 1;
-  tensor.nb[0] = sizeof(float);
-  tensor.nb[1] = static_cast<size_t>(row) * sizeof(float);
-  tensor.nb[2] = tensor.nb[1] * static_cast<size_t>(batch);
-  tensor.nb[3] = tensor.nb[2];
-  tensor.data = data;
-  return tensor;
+  return make_f32_tensor_2d(data, row, batch);
 }
 
 ggml_tensor make_moe_weight_tensor(const Tensor& W, int64_t type, int64_t k,
@@ -482,27 +582,26 @@ bool is_upstream_mmq_type(int64_t type);
 
 int64_t logical_k_from_moe_weight(const Tensor& W, int64_t type,
                                   const char* op_name) {
-  const size_t type_size = type_size_for_type(type, op_name);
-  const int64_t block_size = block_size_for_type(type, op_name);
-  STD_TORCH_CHECK(W.size(2) > 0 && W.size(2) % type_size == 0, op_name,
-                  ": packed expert row size is not a multiple of the "
-                  "quantization type size");
-  return W.size(2) / static_cast<int64_t>(type_size) * block_size;
+  return logical_k_from_packed_row_bytes(W.size(2), type, op_name,
+                                         "expert row");
 }
 
 Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
                                    const Tensor& topk_ids, int64_t type,
-                                   int64_t row, int64_t top_k, int64_t tokens) {
+                                   int64_t row, int64_t top_k, int64_t tokens,
+                                   int64_t k) {
   const int32_t device_index = X.get_device_index();
   const DeviceGuard device_guard(device_index);
   const cudaStream_t stream = current_stream(device_index);
-  const int64_t k = logical_k_from_moe_weight(W, type, "ggml_moe_a8_upstream");
   const int64_t output_rows = tokens * top_k;
 
   ggml_backend_cuda_context context(device_index);
-  context.pools[device_index][0] = std::make_unique<TorchScratchPool>(X);
+  bind_torch_stream_to_context(context, device_index);
+  auto scratch_pool = std::make_unique<TorchScratchPool>(X);
+  TorchScratchPool& pool_ref = *scratch_pool;
+  install_scratch_pool(context, device_index, scratch_pool);
   const DenseBuffers buffers =
-      dense_buffers(X, output_rows, row, 0, context, stream);
+      dense_buffers(X, output_rows, row, 0, pool_ref, stream);
 
   ggml_tensor src0 = make_moe_weight_tensor(W, type, k, row);
   ggml_tensor src1 = make_moe_input_tensor(buffers.input, k, tokens);
@@ -539,12 +638,15 @@ Tensor run_upstream_mmvq(const Tensor& W, const Tensor& X, int64_t type,
   const int64_t k_padded = padded_k(k);
 
   ggml_backend_cuda_context context(device_index);
-  context.pools[device_index][0] = std::make_unique<TorchScratchPool>(X);
+  bind_torch_stream_to_context(context, device_index);
+  auto scratch_pool = std::make_unique<TorchScratchPool>(X);
+  TorchScratchPool& pool_ref = *scratch_pool;
+  install_scratch_pool(context, device_index, scratch_pool);
   const size_t q8_bytes = static_cast<size_t>(batch) *
                           static_cast<size_t>(k_padded) * sizeof(block_q8_1) /
                           kQK8_1;
   const DenseBuffers buffers =
-      dense_buffers(X, X.size(0), row, q8_bytes, context, stream);
+      dense_buffers(X, X.size(0), row, q8_bytes, pool_ref, stream);
   void* q8_data = buffers.q8;
 
   quantize_row_q8_1_cuda(buffers.input, nullptr, q8_data,
@@ -574,52 +676,93 @@ Tensor run_upstream_mmq(const Tensor& W, const Tensor& X, int64_t type,
   const int j_max = ggml_cuda_mmq_get_J_max(static_cast<ggml_type>(type),
                                             fallback, cc, batch);
   if (j_max <= 0 && batch <= kMmvqMaxBatchSize) {
+    // MMVQ is still safe when MMQ has no configuration, even if upstream's
+    // performance policy would normally prefer MMQ on this architecture.
     return run_upstream_mmvq(W, X, type, row, k);
   }
   STD_TORCH_CHECK(
       j_max > 0,
       "ggml_mul_mat_a8: no upstream MMQ configuration for type/shape/device");
 
+  // Native FP4 (Blackwell MMA path): upstream swaps the Q8_1_MMQ activation
+  // format for block_fp4_mmq and needs a separate per-column scale buffer for
+  // NVFP4, with different block sizes, strides and kernel-side ne_block. The
+  // bridge's merged Q8 workspace cannot express that layout, so for these
+  // types hand the whole operator to the upstream wrapper: build plain F32
+  // descriptors for src1/dst and let ggml_cuda_mul_mat_q quantize, allocate
+  // (via the installed TorchScratchPool), scale and launch on ctx.stream()
+  // itself. Describing src1 with the logical k (never k_padded, which would
+  // claim padding we did not allocate) keeps upstream's own
+  // MATRIX_ROW_PADDING handling authoritative.
+  const bool native_fp4 = blackwell_mma_available(cc) &&
+                          (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4);
+  if (native_fp4) {
+    ggml_backend_cuda_context context(device_index);
+    bind_torch_stream_to_context(context, device_index);
+    auto scratch_pool = std::make_unique<TorchScratchPool>(X);
+    TorchScratchPool& pool_ref = *scratch_pool;
+    install_scratch_pool(context, device_index, scratch_pool);
+    // No bridge quantized workspace is needed; output conversion still runs
+    // through the shared dense-buffers conversion path (zero q8 region).
+    const DenseBuffers buffers =
+        dense_buffers(X, X.size(0), row, 0, pool_ref, stream);
+    ggml_tensor src0 = make_quant_tensor(W, type, k, row);
+    ggml_tensor src1 = make_f32_tensor(buffers.input, k, batch);
+    ggml_tensor dst = make_output_tensor(buffers.result, row, batch);
+    ggml_cuda_mul_mat_q(context, &src0, &src1, /*ids=*/nullptr, &dst);
+    check_launch("upstream MMQ (native FP4)");
+    return finish_output(buffers, stream);
+  }
+
   ggml_backend_cuda_context context(device_index);
-  context.pools[device_index][0] = std::make_unique<TorchScratchPool>(X);
+  bind_torch_stream_to_context(context, device_index);
+  auto scratch_pool = std::make_unique<TorchScratchPool>(X);
+  TorchScratchPool& pool_ref = *scratch_pool;
+  install_scratch_pool(context, device_index, scratch_pool);
   const size_t q8_bytes = static_cast<size_t>(batch) *
                               static_cast<size_t>(k_padded) *
                               sizeof(block_q8_1_mmq) / QK8_1_MMQ +
                           static_cast<size_t>(j_max) * sizeof(block_q8_1_mmq);
   const DenseBuffers buffers =
-      dense_buffers(X, X.size(0), row, q8_bytes, context, stream);
+      dense_buffers(X, X.size(0), row, q8_bytes, pool_ref, stream);
   void* q8_data = buffers.q8;
 
   quantize_mmq_q8_1_cuda(buffers.input, nullptr, q8_data,
                          static_cast<ggml_type>(type), k, k, 0, 0, k_padded,
                          batch, 1, 1, stream);
 
-  const mmq_args args{static_cast<const char*>(W.data_ptr()),
-                      static_cast<ggml_type>(type),
-                      static_cast<const int*>(q8_data),
-                      nullptr,
-                      nullptr,
-                      buffers.result,
-                      nullptr,
-                      k,
-                      row,
-                      batch,
-                      static_cast<int64_t>(
-                          W.size(1) / type_size_for_type(type, "upstream MMQ")),
-                      batch,
-                      row,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      1,
-                      batch,
-                      batch};
+  // Named-field initialization (C++17: no designated initializers) so an
+  // upstream mmq_args field addition fails to compile here instead of
+  // silently shifting all subsequent positional values. Every field is
+  // annotated with its source; stride_channel/sample entries use 1 because
+  // the bridge builds a single-channel, single-sample dense descriptor.
+  mmq_args args{};
+  args.x = static_cast<const char*>(W.data_ptr());
+  args.type_x = static_cast<ggml_type>(type);
+  args.y = static_cast<const int*>(q8_data);
+  args.ids_dst = nullptr;        // dense path: no expert routing
+  args.expert_bounds = nullptr;  // dense path: no expert bounds
+  args.dst = buffers.result;
+  args.y_scale = nullptr;  // Q8 activation path: no NVFP4 scale
+  args.ncols_x = k;
+  args.nrows_x = row;
+  args.ncols_dst = batch;
+  args.stride_row_x = static_cast<int64_t>(
+      W.size(1) / type_size_for_type(type, "upstream MMQ"));
+  args.ncols_y = batch;
+  args.nrows_dst = row;
+  args.nchannels_x = 1;
+  args.nchannels_y = 1;
+  args.stride_channel_x = 1;
+  args.stride_channel_y = 1;
+  args.stride_channel_dst = 1;
+  args.nsamples_x = 1;
+  args.nsamples_y = 1;
+  args.stride_sample_x = 1;
+  args.stride_sample_y = 1;
+  args.stride_sample_dst = 1;
+  args.ncols_max = batch;
+  args.ncols_opt = batch;
   ggml_upstream_mul_mat_q(context, args, stream);
   check_launch("upstream MMQ");
   return finish_output(buffers, stream);
@@ -645,7 +788,7 @@ void run_upstream_dequantize(const Tensor& W, Tensor& output, int64_t type,
           stream);
 }
 
-bool upstream_mmvq_eligible(const Tensor& W, const Tensor& X, int64_t type,
+bool upstream_mmvq_runnable(const Tensor& W, const Tensor& X, int64_t type,
                             int64_t k) {
   return is_upstream_type(type) && X.size(0) <= kMmvqMaxBatchSize &&
          has_weight_padding(W, k, type, "ggml_mul_mat_vec_a8");
@@ -678,7 +821,26 @@ bool upstream_mmq_eligible(const Tensor& W, int64_t type, int64_t k) {
          has_weight_padding(W, k, type, "ggml_mul_mat_a8");
 }
 
+Tensor run_upstream_mmvq_or_mmq(const Tensor& W, const Tensor& X, int64_t type,
+                                int64_t row, int64_t k) {
+  const int cc = ggml_cuda_info().devices[X.get_device_index()].cc;
+  if (!ggml_cuda_should_use_mmvq(static_cast<ggml_type>(type), cc, X.size(0)) &&
+      is_upstream_mmq_type(type)) {
+    return run_upstream_mmq(W, X, type, row, k);
+  }
+  return run_upstream_mmvq(W, X, type, row, k);
+}
+
 }  // namespace
+
+bool ggml_should_use_mmvq(int64_t type, int64_t cc, int64_t batch) {
+  // No device lookup here: Python supplies the tensor device's capability,
+  // and policy tests can exercise every architecture without that hardware.
+  return is_upstream_type(type) && batch > 0 && batch <= kMmvqMaxBatchSize &&
+         cc > 0 && cc <= std::numeric_limits<int>::max() &&
+         ggml_cuda_should_use_mmvq(static_cast<ggml_type>(type),
+                                   static_cast<int>(cc), batch);
+}
 
 Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
                                 std::optional<ScalarType> dtype) {
@@ -718,8 +880,23 @@ Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
   STD_TORCH_CHECK(total == 0 || total % block_size == 0,
                   "ggml_dequantize_upstream: output element count must be "
                   "aligned to the quantization block size");
+  // The convert kernels read rows[0..m) from the packed weight, so reject a
+  // row count the input cannot back before launching anything. Callers may
+  // legally decode a prefix (m < W.size(0)); they may not ask for more rows
+  // than the input provides.
+  STD_TORCH_CHECK(m <= W.size(0),
+                  "ggml_dequantize_upstream: requested row count ", m,
+                  " exceeds the packed input capacity ", W.size(0));
 
+  // Validate the dtype before allocating so an unsupported request fails
+  // deterministically regardless of the output shape (an empty output used
+  // to return before dtype dispatch ever ran).
   const auto dtype_ = dtype.value_or(ScalarType::Half);
+  STD_TORCH_CHECK(dtype_ == ScalarType::Float || dtype_ == ScalarType::Half ||
+                      dtype_ == ScalarType::BFloat16,
+                  "ggml_dequantize_upstream: output dtype must be fp32, fp16, "
+                  "or bf16");
+
   Tensor output = torch::stable::new_empty(W, {m, n}, dtype_);
   if (total == 0) {
     return output;
@@ -732,11 +909,8 @@ Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
     run_upstream_dequantize<float>(W, output, type, total, stream);
   } else if (dtype_ == ScalarType::Half) {
     run_upstream_dequantize<half>(W, output, type, total, stream);
-  } else if (dtype_ == ScalarType::BFloat16) {
-    run_upstream_dequantize<nv_bfloat16>(W, output, type, total, stream);
   } else {
-    throw std::runtime_error(
-        "ggml_dequantize_upstream: output dtype must be fp32, fp16, or bf16");
+    run_upstream_dequantize<nv_bfloat16>(W, output, type, total, stream);
   }
   check_launch("upstream dequantize");
   return output;
@@ -753,7 +927,8 @@ Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                   kMoeNotEligibleMarker,
                   ": W lacks required "
                   "MATRIX_ROW_PADDING storage");
-  return run_upstream_moe_projection(W, X, topk_ids, type, row, top_k, tokens);
+  return run_upstream_moe_projection(W, X, topk_ids, type, row, top_k, tokens,
+                                     k);
 }
 
 Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
@@ -782,19 +957,20 @@ Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_vec_a8: X K dimension does not match W");
-    STD_TORCH_CHECK(
-        upstream_mmvq_eligible(W, X, type, k),
-        "ggml_mul_mat_vec_a8: upstream MMVQ requires batch <= 8 and "
-        "MATRIX_ROW_PADDING storage");
-    return run_upstream_mmvq(W, X, type, row, k);
+    STD_TORCH_CHECK(upstream_mmvq_runnable(W, X, type, k),
+                    "ggml_mul_mat_vec_a8: upstream MMVQ requires batch <= ",
+                    kMmvqMaxBatchSize,
+                    " and "
+                    "MATRIX_ROW_PADDING storage");
+    return run_upstream_mmvq_or_mmq(W, X, type, row, k);
   }
 
   if (is_upstream_type(type)) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_vec_a8: X K dimension does not match W");
-    if (upstream_mmvq_eligible(W, X, type, k)) {
-      return run_upstream_mmvq(W, X, type, row, k);
+    if (upstream_mmvq_runnable(W, X, type, k)) {
+      return run_upstream_mmvq_or_mmq(W, X, type, row, k);
     }
   }
   if (is_legacy_mmvq_type(type)) {
