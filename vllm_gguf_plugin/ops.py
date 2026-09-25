@@ -112,6 +112,18 @@ def cuda_upstream_enabled() -> bool:
     return cuda_dense_upstream_enabled()
 
 
+def should_use_upstream_mmvq(X: torch.Tensor, quant_type: int) -> bool:
+    """Query the pinned llama.cpp policy for the input tensor's device.
+
+    This is a host-only query; it neither launches a kernel nor synchronizes.
+    Keep the architecture/type thresholds in upstream rather than copying them
+    into the Python dispatcher. Storage eligibility is checked by the bridge.
+    """
+    major, minor = torch.cuda.get_device_capability(X.device)
+    cc = major * 100 + minor * 10
+    return torch.ops._C_gguf.ggml_should_use_mmvq(quant_type, cc, X.shape[0])
+
+
 def cuda_dequantize_upstream_enabled() -> bool:
     return (
         _CUDA_ENABLED

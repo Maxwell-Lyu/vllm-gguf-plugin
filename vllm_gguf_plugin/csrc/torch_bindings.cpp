@@ -11,6 +11,7 @@ using torch::stable::Tensor;
 Tensor ggml_dequantize(Tensor W, int64_t type, int64_t m, int64_t n,
                        std::optional<ScalarType> dtype);
 #ifndef VLLM_GGUF_LEGACY_ONLY
+bool ggml_should_use_mmvq(int64_t type, int64_t cc, int64_t batch);
 Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
                                 std::optional<ScalarType> dtype);
 #endif
@@ -28,6 +29,9 @@ Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
 int64_t ggml_moe_get_block_size(int64_t type);
 
 STABLE_TORCH_LIBRARY(_C_gguf, ops) {
+#ifndef VLLM_GGUF_LEGACY_ONLY
+  ops.def("ggml_should_use_mmvq(int type, int cc, int batch) -> bool");
+#endif
   ops.def(
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
       "dtype) -> Tensor");
@@ -73,6 +77,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CompositeExplicitAutograd, ops) {
+#ifndef VLLM_GGUF_LEGACY_ONLY
+  ops.impl("ggml_should_use_mmvq", TORCH_BOX(&ggml_should_use_mmvq));
+#endif
   ops.impl("ggml_moe_get_block_size", TORCH_BOX(&ggml_moe_get_block_size));
 }
 

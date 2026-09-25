@@ -73,6 +73,44 @@ vllm serve unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M \
 For a GGUF without a `nextn` block, omit `--speculative-config`; the backbone
 loads normally without MTP.
 
+## Kernel backend selection
+
+On CUDA builds the plugin ships three kernel implementations for GGUF
+quantized operations — upstream (llama.cpp kernels, enabled by default),
+legacy (the plugin's original CUDA kernels), and Triton. The implementation
+is chosen per operation through environment variables:
+
+| Variable | Scope | Default |
+| --- | --- | --- |
+| `VLLM_GGUF_CUDA_KERNEL` | Global fallback for all operations | `auto` |
+| `VLLM_GGUF_CUDA_DENSE_KERNEL` | Dense MMVQ / MMQ | unset (falls back to the global variable) |
+| `VLLM_GGUF_CUDA_MOE_KERNEL` | Routed-expert MoE | unset (falls back to the global variable) |
+| `VLLM_GGUF_CUDA_DEQUANTIZE_KERNEL` | Dequantization | unset (falls back to the global variable) |
+
+Each variable accepts `auto`, `upstream`, `legacy`, or `triton`. A
+specialized variable overrides the global one; if neither is set, the
+operation uses `auto`.
+
+In `auto` mode the dispatcher prefers the upstream kernels, then falls back
+to legacy CUDA, then to Triton, using the first backend that supports the
+quantization type. Explicit modes are strict: when the selected
+implementation cannot handle the quantization type, the call fails instead
+of silently falling back. Dense dispatch uses llama.cpp's architecture- and
+quantization-specific MMVQ thresholds: up to 8 rows by default, with earlier
+transitions to MMQ for selected K-quants on architectures such as Ada and
+Blackwell. ROCm builds always use the legacy kernels.
+
+Example — pin dense kernels to legacy while keeping the automatic selection
+elsewhere:
+
+```bash
+VLLM_GGUF_CUDA_DENSE_KERNEL=legacy vllm serve Qwen/Qwen3-0.6B-GGUF:Q8_0 \
+  --tokenizer Qwen/Qwen3-0.6B
+```
+
+See `doc/upstream.md` for details on the upstream integration, weight
+storage padding, and the supported quantization types per backend.
+
 ## Tested model coverage
 
 The plugin uses vLLM's model implementations and a generic GGUF weight
