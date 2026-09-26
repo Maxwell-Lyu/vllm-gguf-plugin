@@ -127,20 +127,36 @@ size_t ggml_element_size(const ggml_tensor* tensor) {
 }
 
 size_t ggml_nbytes(const ggml_tensor* tensor) {
-  if (ggml_nelements(tensor) == 0) {
-    return 0;
-  }
-  size_t result = ggml_type_size(tensor->type);
   for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-    result += (tensor->ne[i] - 1) * tensor->nb[i];
+    if (tensor->ne[i] <= 0) {
+      return 0;
+    }
+  }
+  const size_t block_size = ggml_blck_size(tensor->type);
+  size_t result = 0;
+  if (block_size == 1) {
+    result = ggml_type_size(tensor->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+      result += (tensor->ne[i] - 1) * tensor->nb[i];
+    }
+  } else {
+    result = tensor->ne[0] * tensor->nb[0] / block_size;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+      result += (tensor->ne[i] - 1) * tensor->nb[i];
+    }
   }
   return result;
 }
 
 bool ggml_is_contiguous(const ggml_tensor* tensor) {
+  const size_t block_size = ggml_blck_size(tensor->type);
   size_t expected = ggml_type_size(tensor->type);
-  for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-    if (tensor->nb[i] != expected) {
+  if (tensor->ne[0] != block_size && tensor->nb[0] != expected) {
+    return false;
+  }
+  expected *= tensor->ne[0] / block_size;
+  for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+    if (tensor->ne[i] != 1 && tensor->nb[i] != expected) {
       return false;
     }
     expected *= tensor->ne[i];
@@ -149,7 +165,9 @@ bool ggml_is_contiguous(const ggml_tensor* tensor) {
 }
 
 bool ggml_is_contiguously_allocated(const ggml_tensor* tensor) {
-  return ggml_is_contiguous(tensor);
+  return ggml_nbytes(tensor) == ggml_nelements(tensor) *
+                                    ggml_type_size(tensor->type) /
+                                    ggml_blck_size(tensor->type);
 }
 
 bool ggml_are_same_stride(const ggml_tensor* t0, const ggml_tensor* t1) {
@@ -284,8 +302,10 @@ size_t ggml_type_size(enum ggml_type type) {
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
   const int64_t block_size = ggml_blck_size(type);
-  return static_cast<size_t>((ne + block_size - 1) / block_size) *
-         ggml_type_size(type);
+  if (ne < 0 || ne % block_size != 0) {
+    throw std::runtime_error("GGML row size is not block aligned");
+  }
+  return static_cast<size_t>(ne / block_size) * ggml_type_size(type);
 }
 
 bool ggml_is_quantized(enum ggml_type type) {

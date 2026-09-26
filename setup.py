@@ -180,6 +180,8 @@ if _should_build_extension():
         sources.extend(
             [
                 "vllm_gguf_plugin/csrc/upstream/bridge.cu",
+                "vllm_gguf_plugin/csrc/upstream/dense_runner.cu",
+                "vllm_gguf_plugin/csrc/upstream/moe_runner.cu",
                 "vllm_gguf_plugin/csrc/upstream/runtime_adapter.cu",
                 *(str(source) for source in UPSTREAM_SOURCES),
             ]
