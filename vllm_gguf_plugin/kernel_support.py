@@ -135,7 +135,8 @@ _register(
     ),
 )
 
-# IQ1_M has no upstream MMQ instance; the other IQ formats do.
+# IQ1_M has no upstream MMQ instance. Dense calls can still use the upstream
+# dequantize + cuBLAS fallback above the MMVQ limit.
 _register(
     _types("IQ1_M"),
     _support(

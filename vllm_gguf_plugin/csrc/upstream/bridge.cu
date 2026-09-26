@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
+#include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -17,6 +20,7 @@
 #include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/c/shim.h>
 
 #include "mmvq.cuh"
 #include "quantize.cuh"
@@ -579,11 +583,151 @@ void check_moe_inputs(const Tensor& X, const Tensor& W, const Tensor& topk_ids,
 }
 
 bool is_upstream_mmq_type(int64_t type);
+Tensor run_upstream_dense(const Tensor& W, const Tensor& X, int64_t type,
+                          int64_t row, int64_t k);
 
 int64_t logical_k_from_moe_weight(const Tensor& W, int64_t type,
                                   const char* op_name) {
   return logical_k_from_packed_row_bytes(W.size(2), type, op_name,
                                          "expert row");
+}
+
+template <typename T>
+__global__ void gather_moe_routes(T* sorted, const T* input,
+                                  const int32_t* routes, int64_t total,
+                                  int64_t top_k, int64_t k) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < total * k) {
+    const int64_t route = index / k;
+    sorted[index] = input[(routes[route] / top_k) * k + index % k];
+  }
+}
+
+template <typename T>
+__global__ void scatter_moe_routes(T* output, const T* sorted,
+                                   const int32_t* routes, int64_t total,
+                                   int64_t row) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < total * row) {
+    output[static_cast<int64_t>(routes[index / row]) * row + index % row] =
+        sorted[index];
+  }
+}
+
+Tensor run_upstream_moe_grouped(const Tensor& W, const Tensor& X,
+                                const Tensor& topk_ids, int64_t type,
+                                int64_t row, int64_t top_k, int64_t tokens,
+                                int64_t k, cudaStream_t stream) {
+  const int64_t total = tokens * top_k;
+  STD_TORCH_CHECK(total <= INT_MAX, kMoeNotEligibleMarker,
+                  ": too many routed tokens for int32 indices");
+  const int64_t experts = W.size(0);
+  std::vector<int32_t> ids(total);
+  STD_TORCH_CHECK(
+      cudaMemcpyAsync(ids.data(), topk_ids.data_ptr(), total * sizeof(int32_t),
+                      cudaMemcpyDeviceToHost, stream) == cudaSuccess,
+      "upstream MoE could not read expert indices");
+  STD_TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess,
+                  "upstream MoE could not synchronize expert indices");
+
+  std::vector<std::vector<int32_t>> by_expert(experts);
+  for (int64_t route = 0; route < total; ++route) {
+    STD_TORCH_CHECK(ids[route] >= 0 && ids[route] < experts,
+                    "upstream MoE expert index out of range");
+    by_expert[ids[route]].push_back(static_cast<int32_t>(route));
+  }
+  std::vector<int32_t> routes;
+  routes.reserve(total);
+  for (const auto& expert_routes : by_expert) {
+    routes.insert(routes.end(), expert_routes.begin(), expert_routes.end());
+  }
+  Tensor device_routes =
+      torch::stable::new_empty(topk_ids, {total}, ScalarType::Int);
+  STD_TORCH_CHECK(
+      cudaMemcpyAsync(device_routes.data_ptr(), routes.data(),
+                      total * sizeof(int32_t), cudaMemcpyHostToDevice,
+                      stream) == cudaSuccess,
+      "upstream MoE could not upload sorted expert indices");
+  STD_TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess,
+                  "upstream MoE could not finish uploading expert indices");
+
+  Tensor sorted_input =
+      torch::stable::new_empty(X, {total, k}, X.scalar_type());
+  const int64_t input_count = total * k;
+  const int input_grid = static_cast<int>((input_count + 255) / 256);
+  if (X.element_size() == sizeof(float)) {
+    gather_moe_routes<<<input_grid, 256, 0, stream>>>(
+        static_cast<uint32_t*>(sorted_input.data_ptr()),
+        static_cast<const uint32_t*>(X.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, top_k, k);
+  } else {
+    gather_moe_routes<<<input_grid, 256, 0, stream>>>(
+        static_cast<uint16_t*>(sorted_input.data_ptr()),
+        static_cast<const uint16_t*>(X.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, top_k, k);
+  }
+  check_launch("upstream MoE gather");
+
+  Tensor sorted_output =
+      torch::stable::new_empty(X, {total, row}, X.scalar_type());
+  int64_t first = 0;
+  for (int64_t expert = 0; expert < experts; ++expert) {
+    const int64_t count = by_expert[expert].size();
+    if (count == 0) {
+      continue;
+    }
+    Tensor expert_weight = torch::stable::select(W, 0, expert);
+    Tensor expert_input = torch::stable::narrow(sorted_input, 0, first, count);
+    Tensor expert_output =
+        run_upstream_dense(expert_weight, expert_input, type, row, k);
+    auto* destination = static_cast<char*>(sorted_output.data_ptr()) +
+                        first * row * X.element_size();
+    STD_TORCH_CHECK(
+        cudaMemcpyAsync(destination, expert_output.data_ptr(),
+                        count * row * X.element_size(),
+                        cudaMemcpyDeviceToDevice, stream) == cudaSuccess,
+        "upstream MoE could not copy expert output");
+    first += count;
+  }
+
+  Tensor output = torch::stable::new_empty(X, {total, row}, X.scalar_type());
+  const int64_t output_count = total * row;
+  const int output_grid = static_cast<int>((output_count + 255) / 256);
+  if (X.element_size() == sizeof(float)) {
+    scatter_moe_routes<<<output_grid, 256, 0, stream>>>(
+        static_cast<uint32_t*>(output.data_ptr()),
+        static_cast<const uint32_t*>(sorted_output.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, row);
+  } else {
+    scatter_moe_routes<<<output_grid, 256, 0, stream>>>(
+        static_cast<uint16_t*>(output.data_ptr()),
+        static_cast<const uint16_t*>(sorted_output.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, row);
+  }
+  check_launch("upstream MoE scatter");
+  return output;
+}
+
+void run_upstream_moe_mmvq_chunks(ggml_backend_cuda_context& context,
+                                  const Tensor& W, const Tensor& topk_ids,
+                                  const DenseBuffers& buffers, int64_t type,
+                                  int64_t row, int64_t top_k, int64_t tokens,
+                                  int64_t k, int64_t chunk_size) {
+  ggml_tensor src0 = make_moe_weight_tensor(W, type, k, row);
+  for (int64_t start = 0; start < tokens; start += chunk_size) {
+    const int64_t count = std::min(chunk_size, tokens - start);
+    ggml_tensor src1 =
+        make_moe_input_tensor(buffers.input + start * k, k, count);
+    ggml_tensor ids = make_moe_ids_tensor(
+        static_cast<const int32_t*>(topk_ids.data_ptr()) + start * top_k, top_k,
+        count);
+    ggml_tensor dst = make_moe_output_tensor(
+        buffers.result + start * top_k * row, row, top_k, count);
+    ggml_cuda_mul_mat_vec_q(context, &src0, &src1, &ids, &dst);
+    check_launch("upstream MoE chunked MMVQ");
+  }
 }
 
 Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
@@ -594,6 +738,29 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
   const DeviceGuard device_guard(device_index);
   const cudaStream_t stream = current_stream(device_index);
   const int64_t output_rows = tokens * top_k;
+  const int cc = ggml_cuda_info().devices[device_index].cc;
+  const int mmvq_max =
+      std::min<int>(kMmvqMaxBatchSize,
+                    get_mmvq_mmid_max_batch(static_cast<ggml_type>(type), cc));
+  const bool use_mmvq = mmvq_max > 0 && tokens <= mmvq_max;
+  const bool fallback = row % 128 != 0;
+  const bool use_mmq = !use_mmvq && is_upstream_mmq_type(type) &&
+                       ggml_cuda_should_use_mmq(static_cast<ggml_type>(type),
+                                                cc, tokens, W.size(0)) &&
+                       ggml_cuda_mmq_get_J_max(static_cast<ggml_type>(type),
+                                               fallback, cc, tokens) > 0;
+  if (!use_mmvq && !use_mmq) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    STD_TORCH_CHECK(
+        cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess,
+        "upstream MoE could not query CUDA graph capture status");
+    if (capture_status == cudaStreamCaptureStatusNone) {
+      return run_upstream_moe_grouped(W, X, topk_ids, type, row, top_k, tokens,
+                                      k, stream);
+    }
+    STD_TORCH_CHECK(mmvq_max > 0, kMoeNotEligibleMarker,
+                    ": no graph-safe MMVQ configuration for type/device");
+  }
 
   ggml_backend_cuda_context context(device_index);
   bind_torch_stream_to_context(context, device_index);
@@ -609,22 +776,15 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
       static_cast<const int32_t*>(topk_ids.data_ptr()), top_k, tokens);
   ggml_tensor dst = make_moe_output_tensor(buffers.result, row, top_k, tokens);
 
-  const int cc = ggml_cuda_info().devices[device_index].cc;
-  const int mmvq_max =
-      get_mmvq_mmid_max_batch(static_cast<ggml_type>(type), cc);
-  if (tokens <= kMmvqMaxBatchSize && tokens <= mmvq_max) {
+  if (use_mmvq) {
     ggml_cuda_mul_mat_vec_q(context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMVQ");
-  } else {
-    const bool fallback = row % 128 != 0;
-    const int j_max = ggml_cuda_mmq_get_J_max(static_cast<ggml_type>(type),
-                                              fallback, cc, tokens);
-    STD_TORCH_CHECK(is_upstream_mmq_type(type) && j_max > 0,
-                    kMoeNotEligibleMarker,
-                    ": no MMQ "
-                    "configuration for type/shape/device");
+  } else if (use_mmq) {
     ggml_cuda_mul_mat_q(context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMQ");
+  } else {
+    run_upstream_moe_mmvq_chunks(context, W, topk_ids, buffers, type, row,
+                                 top_k, tokens, k, mmvq_max);
   }
   return finish_output(buffers, stream);
 }
@@ -788,6 +948,147 @@ void run_upstream_dequantize(const Tensor& W, Tensor& output, int64_t type,
           stream);
 }
 
+ScalarType blas_compute_dtype(int cc) {
+  ScalarType dtype =
+      fast_fp16_hardware_available(cc) ? ScalarType::Half : ScalarType::Float;
+  const char* setting = std::getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+  if (setting != nullptr) {
+    std::string name(setting);
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (name == "f32" || name == "fp32") {
+      dtype = ScalarType::Float;
+    } else if (name == "f16" || name == "fp16") {
+      dtype = ScalarType::Half;
+    } else if (name == "bf16") {
+      dtype = ScalarType::BFloat16;
+    } else {
+      STD_TORCH_CHECK(name == "auto",
+                      "GGML_CUDA_CUBLAS_COMPUTE_TYPE must be auto, f32, f16, "
+                      "or bf16");
+    }
+  }
+  STD_TORCH_CHECK(dtype != ScalarType::BFloat16 || cc >= GGML_CUDA_CC_AMPERE,
+                  "BF16 cuBLAS requires Ampere or newer CUDA hardware");
+  return dtype;
+}
+
+void cast_blas_input(const Tensor& X, Tensor& converted, int64_t count,
+                     cudaStream_t stream) {
+  const auto source = X.scalar_type();
+  const auto target = converted.scalar_type();
+  if (target == ScalarType::Float) {
+    if (source == ScalarType::Half) {
+      gguf_cast_async<float, half>(converted.data_ptr(), X.data_ptr(), count,
+                                   stream);
+    } else {
+      gguf_cast_async<float, nv_bfloat16>(converted.data_ptr(), X.data_ptr(),
+                                          count, stream);
+    }
+  } else if (target == ScalarType::Half) {
+    if (source == ScalarType::Float) {
+      gguf_cast_async<half, float>(converted.data_ptr(), X.data_ptr(), count,
+                                   stream);
+    } else {
+      gguf_cast_async<half, nv_bfloat16>(converted.data_ptr(), X.data_ptr(),
+                                         count, stream);
+    }
+  } else if (source == ScalarType::Float) {
+    gguf_cast_async<nv_bfloat16, float>(converted.data_ptr(), X.data_ptr(),
+                                        count, stream);
+  } else {
+    gguf_cast_async<nv_bfloat16, half>(converted.data_ptr(), X.data_ptr(),
+                                       count, stream);
+  }
+}
+
+Tensor run_upstream_blas(const Tensor& W, const Tensor& X, int64_t type,
+                         int64_t row, int64_t k) {
+  const int32_t device_index = X.get_device_index();
+  const DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = current_stream(device_index);
+  const int cc = ggml_cuda_info().devices[device_index].cc;
+  const ScalarType compute_dtype = blas_compute_dtype(cc);
+  const int64_t batch = X.size(0);
+  STD_TORCH_CHECK(type != GGML_TYPE_MXFP4 || k % 256 == 0,
+                  "upstream MXFP4 cuBLAS requires K aligned to 256 values");
+  STD_TORCH_CHECK(row <= INT_MAX && k <= INT_MAX && batch <= INT_MAX,
+                  "upstream cuBLAS dimensions exceed int32 limits");
+
+  Tensor weights = torch::stable::new_empty(W, {row, k}, compute_dtype);
+  if (compute_dtype == ScalarType::Float) {
+    run_upstream_dequantize<float>(W, weights, type, row * k, stream);
+  } else if (compute_dtype == ScalarType::Half) {
+    run_upstream_dequantize<half>(W, weights, type, row * k, stream);
+  } else {
+    run_upstream_dequantize<nv_bfloat16>(W, weights, type, row * k, stream);
+  }
+
+  Tensor converted;
+  const void* activation = X.data_ptr();
+  if (X.scalar_type() != compute_dtype) {
+    converted = torch::stable::new_empty(X, {batch, k}, compute_dtype);
+    cast_blas_input(X, converted, batch * k, stream);
+    activation = converted.data_ptr();
+  }
+  const bool half_result =
+      compute_dtype == ScalarType::Half && cc != GGML_CUDA_CC_VOLTA;
+  const ScalarType result_dtype =
+      half_result ? ScalarType::Half : ScalarType::Float;
+  Tensor result = torch::stable::new_empty(X, {batch, row}, result_dtype);
+
+  void* raw_handle = nullptr;
+  TORCH_ERROR_CODE_CHECK(torch_get_current_cuda_blas_handle(&raw_handle));
+  auto handle = static_cast<cublasHandle_t>(raw_handle);
+  STD_TORCH_CHECK(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS,
+                  "upstream cuBLAS could not bind the Torch current stream");
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const half alpha_half = __float2half(1.0f);
+  const half beta_half = __float2half(0.0f);
+  const cudaDataType_t input_type =
+      compute_dtype == ScalarType::Float  ? CUDA_R_32F
+      : compute_dtype == ScalarType::Half ? CUDA_R_16F
+                                          : CUDA_R_16BF;
+  const cublasStatus_t status =
+      cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(row),
+                   static_cast<int>(batch), static_cast<int>(k),
+                   half_result ? static_cast<const void*>(&alpha_half)
+                               : static_cast<const void*>(&alpha),
+                   weights.data_ptr(), input_type, static_cast<int>(k),
+                   activation, input_type, static_cast<int>(k),
+                   half_result ? static_cast<const void*>(&beta_half)
+                               : static_cast<const void*>(&beta),
+                   result.data_ptr(), half_result ? CUDA_R_16F : CUDA_R_32F,
+                   static_cast<int>(row),
+                   half_result ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+                   CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS,
+                  "upstream cuBLAS GEMM failed with status ",
+                  static_cast<int>(status));
+
+  if (X.scalar_type() == result_dtype) {
+    return result;
+  }
+  Tensor output = torch::stable::new_empty(X, {batch, row}, X.scalar_type());
+  if (result_dtype == ScalarType::Half &&
+      X.scalar_type() == ScalarType::Float) {
+    gguf_cast_async<float, half>(output.data_ptr(), result.data_ptr(),
+                                 batch * row, stream);
+  } else if (result_dtype == ScalarType::Half) {
+    gguf_cast_async<nv_bfloat16, half>(output.data_ptr(), result.data_ptr(),
+                                       batch * row, stream);
+  } else if (X.scalar_type() == ScalarType::Half) {
+    gguf_cast_async<half, float>(output.data_ptr(), result.data_ptr(),
+                                 batch * row, stream);
+  } else {
+    gguf_cast_async<nv_bfloat16, float>(output.data_ptr(), result.data_ptr(),
+                                        batch * row, stream);
+  }
+  check_launch("upstream cuBLAS output");
+  return output;
+}
+
 bool upstream_mmvq_runnable(const Tensor& W, const Tensor& X, int64_t type,
                             int64_t k) {
   return is_upstream_type(type) && X.size(0) <= kMmvqMaxBatchSize &&
@@ -821,14 +1122,23 @@ bool upstream_mmq_eligible(const Tensor& W, int64_t type, int64_t k) {
          has_weight_padding(W, k, type, "ggml_mul_mat_a8");
 }
 
-Tensor run_upstream_mmvq_or_mmq(const Tensor& W, const Tensor& X, int64_t type,
-                                int64_t row, int64_t k) {
+Tensor run_upstream_dense(const Tensor& W, const Tensor& X, int64_t type,
+                          int64_t row, int64_t k) {
+  const DeviceGuard device_guard(X.get_device_index());
   const int cc = ggml_cuda_info().devices[X.get_device_index()].cc;
-  if (!ggml_cuda_should_use_mmvq(static_cast<ggml_type>(type), cc, X.size(0)) &&
-      is_upstream_mmq_type(type)) {
+  const auto quant_type = static_cast<ggml_type>(type);
+  const int64_t batch = X.size(0);
+  if (ggml_cuda_should_use_mmvq(quant_type, cc, batch) &&
+      upstream_mmvq_runnable(W, X, type, k)) {
+    return run_upstream_mmvq(W, X, type, row, k);
+  }
+  if (is_upstream_mmq_type(type) &&
+      ggml_cuda_should_use_mmq(quant_type, cc, batch, 0) &&
+      upstream_mmq_eligible(W, type, k) &&
+      ggml_cuda_mmq_get_J_max(quant_type, row % 128 != 0, cc, batch) > 0) {
     return run_upstream_mmq(W, X, type, row, k);
   }
-  return run_upstream_mmvq(W, X, type, row, k);
+  return run_upstream_blas(W, X, type, row, k);
 }
 
 }  // namespace
@@ -957,21 +1267,14 @@ Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_vec_a8: X K dimension does not match W");
-    STD_TORCH_CHECK(upstream_mmvq_runnable(W, X, type, k),
-                    "ggml_mul_mat_vec_a8: upstream MMVQ requires batch <= ",
-                    kMmvqMaxBatchSize,
-                    " and "
-                    "MATRIX_ROW_PADDING storage");
-    return run_upstream_mmvq_or_mmq(W, X, type, row, k);
+    return run_upstream_dense(W, X, type, row, k);
   }
 
   if (is_upstream_type(type)) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_vec_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_vec_a8: X K dimension does not match W");
-    if (upstream_mmvq_runnable(W, X, type, k)) {
-      return run_upstream_mmvq_or_mmq(W, X, type, row, k);
-    }
+    return run_upstream_dense(W, X, type, row, k);
   }
   if (is_legacy_mmvq_type(type)) {
     return ggml_mul_mat_vec_a8_legacy(W, X, type, row);
@@ -1000,24 +1303,19 @@ Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
   }
   if (mode == KernelMode::kUpstream) {
     STD_TORCH_CHECK(
-        is_upstream_mmq_type(type),
-        "ggml_mul_mat_a8: no upstream MMQ kernel for quantization type ", type);
+        is_upstream_type(type),
+        "ggml_mul_mat_a8: no upstream CUDA path for quantization type ", type);
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_a8: X K dimension does not match W");
-    STD_TORCH_CHECK(
-        upstream_mmq_eligible(W, type, k),
-        "ggml_mul_mat_a8: upstream MMQ requires MATRIX_ROW_PADDING storage");
-    return run_upstream_mmq(W, X, type, row, k);
+    return run_upstream_dense(W, X, type, row, k);
   }
 
-  if (is_upstream_mmq_type(type)) {
+  if (is_upstream_type(type)) {
     const int64_t k = logical_k_from_weight(W, type, "ggml_mul_mat_a8");
     STD_TORCH_CHECK(X.size(1) == k,
                     "ggml_mul_mat_a8: X K dimension does not match W");
-    if (upstream_mmq_eligible(W, type, k)) {
-      return run_upstream_mmq(W, X, type, row, k);
-    }
+    return run_upstream_dense(W, X, type, row, k);
   }
   if (is_legacy_mmq_type(type)) {
     return ggml_mul_mat_a8_legacy(W, X, type, row);

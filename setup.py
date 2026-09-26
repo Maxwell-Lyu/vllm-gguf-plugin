@@ -200,7 +200,7 @@ if _should_build_extension():
                 pathlib.Path("vllm_gguf_plugin/csrc/gguf"),
             )
         ]
-        extra_link_args = ["-Wl,--gc-sections"]
+        extra_link_args = ["-Wl,--gc-sections", "-lcublas"]
     else:
         include_dirs = [
             str(path.resolve())

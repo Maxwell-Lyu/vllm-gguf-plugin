@@ -59,10 +59,10 @@ def _fused_mul_mat_gguf(
 
     if use_mmvq and (weight_type in MMVQ_QUANT_TYPES or upstream_mmvq):
         return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
-    upstream_mmq = ops.cuda_dense_upstream_enabled() and supports(
-        weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.MMQ
+    upstream_matmul = ops.cuda_dense_upstream_enabled() and supports(
+        weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.DEQUANTIZE
     )
-    if weight_type in DEQUANT_TYPES or upstream_mmq:
+    if weight_type in DEQUANT_TYPES or upstream_matmul:
         return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     weight_type = WeightType(weight_type)
     raise NotImplementedError(f"Unsupported GGUF quantization type: {weight_type}")

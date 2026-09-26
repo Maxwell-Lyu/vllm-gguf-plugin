@@ -158,7 +158,12 @@ def _cuda_gemm_kernel_available(op_name: str, quant_type: int) -> bool:
         if mode in {"upstream", "auto"}
         else QuantizationBackend.LEGACY
     )
-    return supports(quant_type, backend, QuantizationOperation.MMQ)
+    operation = (
+        QuantizationOperation.DEQUANTIZE
+        if backend == QuantizationBackend.UPSTREAM
+        else QuantizationOperation.MMQ
+    )
+    return supports(quant_type, backend, operation)
 
 
 def _cuda_moe_kernel_available(op_name: str, quant_type: int) -> bool:
@@ -391,7 +396,7 @@ def ggml_mul_mat_a8(
 ) -> torch.Tensor:
     mode = cuda_dense_kernel_mode()
     upstream_available = _cuda_upstream_supports(
-        "ggml_mul_mat_a8", quant_type, QuantizationOperation.MMQ
+        "ggml_mul_mat_a8", quant_type, QuantizationOperation.DEQUANTIZE
     )
     legacy_available = supports(
         quant_type, QuantizationBackend.LEGACY, QuantizationOperation.MMQ
