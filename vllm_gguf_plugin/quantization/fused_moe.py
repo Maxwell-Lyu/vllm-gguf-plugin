@@ -130,12 +130,12 @@ def _fused_moe_gguf(
         _, N, _ = w1.shape
         top_k = topk_ids.shape[1]
         try:
-            out = ops.ggml_moe_a8_upstream(
+            out = ops.ggml_moe_upstream(
                 x, w1, topk_ids, weight_type, N, top_k, num_tokens
             )
             out = act(out)
             flat_topk_ids = topk_ids.reshape(-1, 1)
-            out = ops.ggml_moe_a8_upstream(
+            out = ops.ggml_moe_upstream(
                 out,
                 w2,
                 flat_topk_ids,
@@ -151,7 +151,7 @@ def _fused_moe_gguf(
             return out_hidden_states
         except RuntimeError as error:
             # The upstream op embeds MOE_NOT_ELIGIBLE_MARKER (defined in both
-            # kernel_support.py and bridge.cu) when the inputs cannot run on
+            # kernel_support.py and runtime_moe.cu) when the inputs cannot run on
             # the upstream MoE kernel; auto mode may then fall back.
             if moe_mode != "auto" or MOE_NOT_ELIGIBLE_MARKER not in str(error):
                 raise

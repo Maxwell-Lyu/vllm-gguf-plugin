@@ -42,27 +42,42 @@ def _fused_mul_mat_gguf(
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    upstream_enabled = ops.cuda_dense_upstream_enabled()
     if weight_type in UNQUANTIZED_TYPES:
+        if upstream_enabled:
+            caps = ops.dense_upstream_capabilities(
+                weight, x, weight_type, weight.shape[0]
+            )
+            if caps & ops.DENSE_MMVF:
+                return ops.ggml_dense_mmvf(weight, x, weight_type, weight.shape[0])
+            if caps & ops.DENSE_MMF:
+                return ops.ggml_dense_mmf(weight, x, weight_type, weight.shape[0])
         return x @ weight.T
 
-    upstream_mmvq = ops.cuda_dense_upstream_enabled() and supports(
-        weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.MMVQ
-    )
-    if upstream_mmvq:
-        use_mmvq = ops.should_use_upstream_mmvq(x, weight_type)
-    else:
-        if weight_type in IMATRIX_QUANT_TYPES:
-            mmvq_safe = 8 if weight.shape[0] > 5120 else 16
-        else:
-            mmvq_safe = 2 if weight.shape[0] > 5120 else 6
-        use_mmvq = x.shape[0] <= mmvq_safe
-
-    if use_mmvq and (weight_type in MMVQ_QUANT_TYPES or upstream_mmvq):
-        return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
-    upstream_matmul = ops.cuda_dense_upstream_enabled() and supports(
+    upstream_matmul = upstream_enabled and supports(
         weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.DEQUANTIZE
     )
-    if weight_type in DEQUANT_TYPES or upstream_matmul:
+    if upstream_matmul:
+        caps = ops.dense_upstream_capabilities(weight, x, weight_type, weight.shape[0])
+        if caps & ops.DENSE_MMVQ:
+            return ops.ggml_dense_mmvq(weight, x, weight_type, weight.shape[0])
+        if caps & ops.DENSE_MMQ:
+            return ops.ggml_dense_mmq(weight, x, weight_type, weight.shape[0])
+        if caps & ops.DENSE_BLAS:
+            return ops.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
+        raise RuntimeError(
+            f"No upstream dense kernel for quantization type {weight_type}"
+        )
+
+    if weight_type in IMATRIX_QUANT_TYPES:
+        mmvq_safe = 8 if weight.shape[0] > 5120 else 16
+    else:
+        mmvq_safe = 2 if weight.shape[0] > 5120 else 6
+    use_mmvq = x.shape[0] <= mmvq_safe
+
+    if use_mmvq and weight_type in MMVQ_QUANT_TYPES:
+        return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+    if weight_type in DEQUANT_TYPES:
         return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     weight_type = WeightType(weight_type)
     raise NotImplementedError(f"Unsupported GGUF quantization type: {weight_type}")

@@ -124,6 +124,39 @@ def should_use_upstream_mmvq(X: torch.Tensor, quant_type: int) -> bool:
     return torch.ops._C_gguf.ggml_should_use_mmvq(quant_type, cc, X.shape[0])
 
 
+DENSE_MMVF = 1
+DENSE_MMF = 2
+DENSE_MMVQ = 4
+DENSE_MMQ = 8
+DENSE_BLAS = 16
+
+
+def dense_upstream_capabilities(
+    W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
+) -> int:
+    return torch.ops._C_gguf.ggml_dense_upstream_capabilities(W, X, quant_type, row)
+
+
+def ggml_dense_mmvq(W, X, quant_type, row):
+    return torch.ops._C_gguf.ggml_dense_mmvq(W, X, quant_type, row)
+
+
+def ggml_dense_mmq(W, X, quant_type, row):
+    return torch.ops._C_gguf.ggml_dense_mmq(W, X, quant_type, row)
+
+
+def ggml_dense_mmvf(W, X, quant_type, row):
+    return torch.ops._C_gguf.ggml_dense_mmvf(W, X, quant_type, row)
+
+
+def ggml_dense_mmf(W, X, quant_type, row):
+    return torch.ops._C_gguf.ggml_dense_mmf(W, X, quant_type, row)
+
+
+def ggml_dense_blas(W, X, quant_type, row):
+    return torch.ops._C_gguf.ggml_dense_blas(W, X, quant_type, row)
+
+
 def cuda_dequantize_upstream_enabled() -> bool:
     return (
         _CUDA_ENABLED
@@ -207,6 +240,14 @@ if (
     ) -> torch.Tensor:
         return torch.empty((m, n), dtype=dtype or torch.float16, device=W.device)
 
+    @register_fake("_C_gguf::ggml_dense_mmvq")
+    @register_fake("_C_gguf::ggml_dense_mmq")
+    @register_fake("_C_gguf::ggml_dense_mmvf")
+    @register_fake("_C_gguf::ggml_dense_mmf")
+    @register_fake("_C_gguf::ggml_dense_blas")
+    def _ggml_dense_explicit_fake(W, X, quant_type, row):
+        return torch.empty((X.size(0), row), dtype=X.dtype, device=X.device)
+
     @register_fake("_C_gguf::ggml_mul_mat_vec_a8")
     def _ggml_mul_mat_vec_a8_fake(
         W: torch.Tensor,
@@ -258,6 +299,20 @@ if (
     ) -> torch.Tensor:
         del topk_ids, quant_type, tokens
         return torch.empty((X.size(0) * top_k, row), dtype=X.dtype, device=W.device)
+
+    @register_fake("_C_gguf::ggml_moe_upstream")
+    def _ggml_moe_upstream_fake(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        topk_ids: torch.Tensor,
+        quant_type: int,
+        row: torch.SymInt,
+        top_k: torch.SymInt,
+        tokens: torch.SymInt,
+    ) -> torch.Tensor:
+        return _ggml_moe_a8_upstream_fake(
+            X, W, topk_ids, quant_type, row, top_k, tokens
+        )
 
 
 if (
@@ -426,7 +481,25 @@ def ggml_mul_mat_a8(
 
 
 def cuda_moe_upstream_kernel_available(quant_type: int) -> bool:
-    return _cuda_moe_upstream_kernel_available("ggml_moe_a8_upstream", quant_type)
+    return _cuda_moe_upstream_kernel_available("ggml_moe_upstream", quant_type)
+
+
+def ggml_moe_upstream(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type: int,
+    row: int,
+    top_k: int,
+    tokens: int,
+) -> torch.Tensor:
+    if _cuda_moe_upstream_kernel_available("ggml_moe_upstream", quant_type):
+        return torch.ops._C_gguf.ggml_moe_upstream(
+            X, W, topk_ids, quant_type, row, top_k, tokens
+        )
+    raise RuntimeError(
+        f"upstream MoE CUDA kernel is unavailable for quantization type {quant_type}"
+    )
 
 
 def ggml_moe_a8_upstream(
@@ -438,13 +511,8 @@ def ggml_moe_a8_upstream(
     top_k: int,
     tokens: int,
 ) -> torch.Tensor:
-    if _cuda_moe_upstream_kernel_available("ggml_moe_a8_upstream", quant_type):
-        return torch.ops._C_gguf.ggml_moe_a8_upstream(
-            X, W, topk_ids, quant_type, row, top_k, tokens
-        )
-    raise RuntimeError(
-        f"upstream MoE CUDA kernel is unavailable for quantization type {quant_type}"
-    )
+    """Compatibility alias for the quantized MoE entry point."""
+    return ggml_moe_upstream(X, W, topk_ids, quant_type, row, top_k, tokens)
 
 
 def ggml_moe_a8(

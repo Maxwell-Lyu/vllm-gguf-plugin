@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "common.cuh"
+#include "ggml_constants.cuh"
 
 namespace {
 
@@ -200,42 +200,25 @@ enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(
   return GGML_BACKEND_BUFFER_USAGE_ANY;
 }
 
+const char* ggml_type_name(enum ggml_type type) {
+  switch (type) {
+#define GGUF_NAME_CASE(value, block, cpp_type, name, quantized, mmq) \
+  case value:                                                        \
+    return name;
+    GGUF_GGML_TYPE_TRAITS(GGUF_NAME_CASE)
+#undef GGUF_NAME_CASE
+    default:
+      return "unsupported";
+  }
+}
+
 int64_t ggml_blck_size(enum ggml_type type) {
   switch (type) {
-    case GGML_TYPE_F32:
-    case GGML_TYPE_F16:
-    case GGML_TYPE_BF16:
-    case GGML_TYPE_I32:
-      return 1;
-    case GGML_TYPE_Q1_0:
-      return 128;
-    case GGML_TYPE_Q2_0:
-      return 64;
-    case GGML_TYPE_MXFP4:
-      return 32;
-    case GGML_TYPE_NVFP4:
-      return 64;
-    case GGML_TYPE_Q4_0:
-    case GGML_TYPE_Q4_1:
-    case GGML_TYPE_Q5_0:
-    case GGML_TYPE_Q5_1:
-    case GGML_TYPE_Q8_0:
-    case GGML_TYPE_IQ4_NL:
-      return 32;
-    case GGML_TYPE_Q2_K:
-    case GGML_TYPE_Q3_K:
-    case GGML_TYPE_Q4_K:
-    case GGML_TYPE_Q5_K:
-    case GGML_TYPE_Q6_K:
-    case GGML_TYPE_IQ2_XXS:
-    case GGML_TYPE_IQ2_XS:
-    case GGML_TYPE_IQ2_S:
-    case GGML_TYPE_IQ3_XXS:
-    case GGML_TYPE_IQ1_S:
-    case GGML_TYPE_IQ1_M:
-    case GGML_TYPE_IQ4_XS:
-    case GGML_TYPE_IQ3_S:
-      return 256;
+#define GGUF_BLOCK_CASE(value, block, cpp_type, name, quantized, mmq) \
+  case value:                                                         \
+    return block;
+    GGUF_GGML_TYPE_TRAITS(GGUF_BLOCK_CASE)
+#undef GGUF_BLOCK_CASE
     default:
       throw std::runtime_error("unsupported GGML block size in CUDA adapter");
   }
@@ -243,58 +226,11 @@ int64_t ggml_blck_size(enum ggml_type type) {
 
 size_t ggml_type_size(enum ggml_type type) {
   switch (type) {
-    case GGML_TYPE_F32:
-    case GGML_TYPE_I32:
-      return sizeof(float);
-    case GGML_TYPE_F16:
-    case GGML_TYPE_BF16:
-      return sizeof(uint16_t);
-    case GGML_TYPE_Q1_0:
-      return sizeof(block_q1_0);
-    case GGML_TYPE_Q2_0:
-      return sizeof(block_q2_0);
-    case GGML_TYPE_MXFP4:
-      return sizeof(block_mxfp4);
-    case GGML_TYPE_NVFP4:
-      return sizeof(block_nvfp4);
-    case GGML_TYPE_Q4_0:
-      return sizeof(block_q4_0);
-    case GGML_TYPE_Q4_1:
-      return sizeof(block_q4_1);
-    case GGML_TYPE_Q5_0:
-      return sizeof(block_q5_0);
-    case GGML_TYPE_Q5_1:
-      return sizeof(block_q5_1);
-    case GGML_TYPE_Q8_0:
-      return sizeof(block_q8_0);
-    case GGML_TYPE_Q2_K:
-      return sizeof(block_q2_K);
-    case GGML_TYPE_Q3_K:
-      return sizeof(block_q3_K);
-    case GGML_TYPE_Q4_K:
-      return sizeof(block_q4_K);
-    case GGML_TYPE_Q5_K:
-      return sizeof(block_q5_K);
-    case GGML_TYPE_Q6_K:
-      return sizeof(block_q6_K);
-    case GGML_TYPE_IQ2_XXS:
-      return sizeof(block_iq2_xxs);
-    case GGML_TYPE_IQ2_XS:
-      return sizeof(block_iq2_xs);
-    case GGML_TYPE_IQ2_S:
-      return sizeof(block_iq2_s);
-    case GGML_TYPE_IQ3_XXS:
-      return sizeof(block_iq3_xxs);
-    case GGML_TYPE_IQ1_S:
-      return sizeof(block_iq1_s);
-    case GGML_TYPE_IQ1_M:
-      return sizeof(block_iq1_m);
-    case GGML_TYPE_IQ4_NL:
-      return sizeof(block_iq4_nl);
-    case GGML_TYPE_IQ4_XS:
-      return sizeof(block_iq4_xs);
-    case GGML_TYPE_IQ3_S:
-      return sizeof(block_iq3_s);
+#define GGUF_SIZE_CASE(value, block, cpp_type, name, quantized, mmq) \
+  case value:                                                        \
+    return sizeof(cpp_type);
+    GGUF_GGML_TYPE_TRAITS(GGUF_SIZE_CASE)
+#undef GGUF_SIZE_CASE
     default:
       throw std::runtime_error("unsupported GGML type size in CUDA adapter");
   }
@@ -309,11 +245,16 @@ size_t ggml_row_size(enum ggml_type type, int64_t ne) {
 }
 
 bool ggml_is_quantized(enum ggml_type type) {
-  return type >= GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_1 &&
-         type != GGML_TYPE_I8 && type != GGML_TYPE_I16 &&
-         type != GGML_TYPE_I32 && type != GGML_TYPE_I64 &&
-         type != GGML_TYPE_F32 && type != GGML_TYPE_F16 &&
-         type != GGML_TYPE_BF16 && type != GGML_TYPE_F64;
+  switch (type) {
+#define GGUF_QUANT_CASE(value, block, cpp_type, name, quantized, mmq) \
+  case value:                                                         \
+    return quantized != 0;
+    GGUF_GGML_TYPE_TRAITS(GGUF_QUANT_CASE)
+#undef GGUF_QUANT_CASE
+    default:
+      throw std::runtime_error(
+          "unsupported GGML quantization type in CUDA adapter");
+  }
 }
 
 }  // extern "C"

@@ -18,6 +18,8 @@ class QuantizationOperation(str, Enum):
     DEQUANTIZE = "dequantize"
     MMVQ = "mmvq"
     MMQ = "mmq"
+    MMVF = "mmvf"
+    MMF = "mmf"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +72,7 @@ _UPSTREAM_ALL = (
     QuantizationOperation.MMVQ,
     QuantizationOperation.MMQ,
 )
+_UPSTREAM_FLOAT = (QuantizationOperation.MMVF, QuantizationOperation.MMF)
 
 
 def _support(
@@ -124,6 +127,9 @@ def _register(types: Iterable[WeightType], support: QuantizationSupport) -> None
 
 # Q8_1 is available through Triton's generic quantized path only.
 _register(_types("Q8_1"), _support(triton=_TRITON_ALL))
+
+# Floating MoE projections use the upstream MMVF/MMF wrappers with ids.
+_register(_types("F32", "F16", "BF16"), _support(upstream=_UPSTREAM_FLOAT))
 
 # Standard and K-quant formats have all three operations in every CUDA path.
 _register(
@@ -184,10 +190,16 @@ def supports(
 
 
 def supports_moe(weight_type: int, backend: QuantizationBackend) -> bool:
-    """MoE projections use either the MMVQ or MMQ kernel by token count."""
+    """Report whether this backend has a MoE projection kernel family."""
     support = get_quantization_support(weight_type)
-    return support.supports(backend, QuantizationOperation.MMVQ) or support.supports(
-        backend, QuantizationOperation.MMQ
+    return any(
+        support.supports(backend, operation)
+        for operation in (
+            QuantizationOperation.MMVQ,
+            QuantizationOperation.MMQ,
+            QuantizationOperation.MMVF,
+            QuantizationOperation.MMF,
+        )
     )
 
 
@@ -237,11 +249,11 @@ IMATRIX_QUANT_TYPES = frozenset(_IQ_TYPES)
 
 _UPSTREAM_STORAGE_TYPES = CUDA_UPSTREAM_MMVQ_TYPES | CUDA_UPSTREAM_MMQ_TYPES
 
-# Must match the upstream MATRIX_ROW_PADDING macro (common.cuh); bridge.cu
+# Must match the upstream MATRIX_ROW_PADDING macro (common.cuh); ggml_dypes.cuh
 # static-asserts the C++ side stays a multiple of this value.
 _MATRIX_ROW_PADDING = 512
 
-# Stable error-message marker emitted by csrc/upstream/bridge.cu whenever the
+# Stable error-message marker emitted by csrc/upstream/runtime_moe.cu whenever the
 # upstream MoE kernel cannot run its inputs. fused_moe.py matches on this to
 # decide whether auto mode may fall back to the legacy/Triton MoE path. Both
 # sides must change together.

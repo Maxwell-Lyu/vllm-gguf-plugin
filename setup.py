@@ -56,7 +56,8 @@ def _check_upstream_checkout() -> None:
     template_root = UPSTREAM_CUDA_ROOT / "template-instances"
     actual_template_instances = {
         path.relative_to(UPSTREAM_ROOT).as_posix()
-        for path in template_root.glob("mmq-instance-*.cu")
+        for pattern in ("mmq-instance-*.cu", "mmf-instance-ncols_*.cu")
+        for path in template_root.glob(pattern)
     }
     listed_sources = {
         path.relative_to(UPSTREAM_ROOT).as_posix() for path in UPSTREAM_SOURCES
@@ -65,8 +66,9 @@ def _check_upstream_checkout() -> None:
     extra_template_instances = {
         path
         for path in listed_sources
-        if path.startswith("ggml/src/ggml-cuda/template-instances/mmq-instance-")
+        if path.startswith("ggml/src/ggml-cuda/template-instances/")
         and path.endswith(".cu")
+        and path.rsplit("/", 1)[-1].startswith(("mmq-instance-", "mmf-instance-ncols_"))
     } - actual_template_instances
     if missing_template_instances or extra_template_instances:
         raise RuntimeError(
@@ -158,7 +160,7 @@ if _should_build_extension():
             ]
         )
     else:
-        # The public dense entry points are provided by bridge.cu on CUDA.
+        # Upstream CUDA entry points live in runtime_dense.cu and runtime_moe.cu.
         # Keep ROCm on the unchanged legacy implementation.
         nvcc_args.append("-DVLLM_GGUF_LEGACY_ONLY")
 
@@ -179,10 +181,11 @@ if _should_build_extension():
     if not is_rocm:
         sources.extend(
             [
-                "vllm_gguf_plugin/csrc/upstream/bridge.cu",
-                "vllm_gguf_plugin/csrc/upstream/dense_runner.cu",
-                "vllm_gguf_plugin/csrc/upstream/moe_runner.cu",
-                "vllm_gguf_plugin/csrc/upstream/runtime_adapter.cu",
+                "vllm_gguf_plugin/csrc/upstream/runtime_dense.cu",
+                "vllm_gguf_plugin/csrc/upstream/runtime_moe.cu",
+                "vllm_gguf_plugin/csrc/upstream/runtime_dequant_blas.cu",
+                "vllm_gguf_plugin/csrc/upstream/torch_context.cu",
+                "vllm_gguf_plugin/csrc/upstream/runtime.cu",
                 *(str(source) for source in UPSTREAM_SOURCES),
             ]
         )
