@@ -80,7 +80,14 @@ int64_t checked_moe_product(int64_t lhs, int64_t rhs, const char* name) {
   return lhs * rhs;
 }
 
-enum class MoeKernel { kMmvq, kMmq, kIq1MChunks, kMmvf, kMmf };
+// mmid.cu stores one 4-byte mm_ids_helper_store per token in dynamic shared
+// memory. Its token index also has a 22-bit limit.
+int64_t mmid_max_tokens(size_t smpbo) {
+  return static_cast<int64_t>(
+      std::min<size_t>(smpbo / sizeof(int32_t), (1u << 22) - 1));
+}
+
+enum class MoeKernel { kMmvq, kMmq, kMmqChunks, kIq1MChunks, kMmvf, kMmf };
 
 MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
                             int64_t tokens, int cc, int warp_size, size_t smpbo,
@@ -115,7 +122,8 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
   const bool fallback = row % 128 != 0;
   if (upstream_mmq_type_supported(type) && smpbo >= 48 * 1024 &&
       ggml_cuda_mmq_get_J_max(ggml_type, fallback, cc, tokens) > 0) {
-    return MoeKernel::kMmq;
+    return tokens <= mmid_max_tokens(smpbo) ? MoeKernel::kMmq
+                                            : MoeKernel::kMmqChunks;
   }
   if (type == GGML_TYPE_IQ1_M && *mmvq_max > 0) {
     return MoeKernel::kIq1MChunks;
@@ -162,9 +170,18 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
     ggml_cuda_mul_mat_f(call.context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMF");
   } else {
-    // IQ1_M has no MMQ instance; keep MMVQ within its per-call token limit.
-    for (int64_t start = 0; start < tokens; start += mmvq_max) {
-      const int64_t count = std::min<int64_t>(mmvq_max, tokens - start);
+    // MMQ's mmid helper needs 4 shared-memory bytes per token. IQ1_M has no
+    // MMQ instance, so its MMVQ calls retain the existing batch limit.
+    const bool chunked_mmq = kernel == MoeKernel::kMmqChunks;
+    const int64_t chunk_size =
+        chunked_mmq ? mmid_max_tokens(device.smpbo) : mmvq_max;
+    for (int64_t start = 0; start < tokens;) {
+      int64_t count = std::min<int64_t>(chunk_size, tokens - start);
+      if (chunked_mmq && tokens - start - count > 0 &&
+          tokens - start - count < gguf_constants::kMmqTileStep) {
+        // ggml_cuda_mmq_get_J_max rounds down to one J tile.
+        count -= gguf_constants::kMmqTileStep - (tokens - start - count);
+      }
       ggml_tensor chunk_input =
           make_moe_input_tensor(buffers.input + start * k, k, count);
       ggml_tensor chunk_ids = make_moe_ids_tensor(
@@ -172,9 +189,16 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
           top_k, count);
       ggml_tensor chunk_output = make_moe_output_tensor(
           buffers.result + start * top_k * row, row, top_k, count);
-      ggml_cuda_mul_mat_vec_q(call.context, &src0, &chunk_input, &chunk_ids,
-                              &chunk_output);
-      check_launch("upstream MoE IQ1_M MMVQ");
+      if (chunked_mmq) {
+        ggml_cuda_mul_mat_q(call.context, &src0, &chunk_input, &chunk_ids,
+                            &chunk_output);
+        check_launch("upstream MoE chunked MMQ");
+      } else {
+        ggml_cuda_mul_mat_vec_q(call.context, &src0, &chunk_input, &chunk_ids,
+                                &chunk_output);
+        check_launch("upstream MoE IQ1_M MMVQ");
+      }
+      start += count;
     }
   }
   return finish_output(buffers, call.stream);
