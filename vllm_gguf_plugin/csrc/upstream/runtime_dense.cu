@@ -8,17 +8,11 @@
 #include "quantize.cuh"
 
 #include <climits>
-#include <cstdlib>
 #include <limits>
-#include <stdexcept>
-#include <string>
 #include <torch/csrc/stable/ops.h>
 
 using torch::headeronly::ScalarType;
 
-Tensor ggml_mul_mat_vec_a8_legacy(Tensor W, Tensor X, int64_t type,
-                                  int64_t row);
-Tensor ggml_mul_mat_a8_legacy(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor run_upstream_blas(const Tensor& W, const Tensor& X, int64_t type,
                          int64_t row, int64_t k);
 
@@ -29,31 +23,8 @@ constexpr int64_t kDenseMmvq = 4;
 constexpr int64_t kDenseMmq = 8;
 constexpr int64_t kDenseBlas = 16;
 
-enum class KernelMode { kAuto, kUpstream, kLegacy, kTriton };
-
-KernelMode kernel_mode() {
-  const char* value = std::getenv("VLLM_GGUF_CUDA_DENSE_KERNEL");
-  if (value == nullptr) {
-    value = std::getenv("VLLM_GGUF_CUDA_KERNEL");
-  }
-  if (value == nullptr || std::string(value) == "auto") {
-    return KernelMode::kAuto;
-  }
-  if (std::string(value) == "upstream") {
-    return KernelMode::kUpstream;
-  }
-  if (std::string(value) == "legacy") {
-    return KernelMode::kLegacy;
-  }
-  if (std::string(value) == "triton") {
-    return KernelMode::kTriton;
-  }
-  throw std::runtime_error(
-      "VLLM_GGUF_CUDA_DENSE_KERNEL must be one of auto|upstream|legacy|triton");
-}
-
 void check_dense_inputs(const Tensor& W, const Tensor& X, int64_t row,
-                        const char* op_name, bool packed_weight) {
+                        const char* op_name) {
   STD_TORCH_CHECK(W.is_cuda() && X.is_cuda(), op_name,
                   ": W and X must be CUDA tensors");
   STD_TORCH_CHECK(W.get_device_index() == X.get_device_index(), op_name,
@@ -66,61 +37,8 @@ void check_dense_inputs(const Tensor& W, const Tensor& X, int64_t row,
                       X.scalar_type() == ScalarType::Half ||
                       X.scalar_type() == ScalarType::BFloat16,
                   op_name, ": X must have dtype fp32, fp16, or bf16");
-  if (packed_weight) {
-    STD_TORCH_CHECK(W.element_size() == 1, op_name,
-                    ": W must contain packed byte data");
-  }
   STD_TORCH_CHECK(row > 0 && row <= W.size(0), op_name,
                   ": row must be in (0, W.size(0)]");
-}
-
-bool is_legacy_mmvq_type(int64_t type) {
-  // Explicit whitelist mirroring kernel_support.py's LEGACY MMVQ set. Do NOT
-  // derive this from is_upstream_weight_type by exclusion: a new upstream type
-  // would then be wrongly reported as legacy-capable while gguf_kernel.cu's
-  // fixed switch has no instance for it.
-  switch (type) {
-    case GGML_TYPE_Q4_0:
-    case GGML_TYPE_Q4_1:
-    case GGML_TYPE_Q5_0:
-    case GGML_TYPE_Q5_1:
-    case GGML_TYPE_Q8_0:
-    case GGML_TYPE_Q2_K:
-    case GGML_TYPE_Q3_K:
-    case GGML_TYPE_Q4_K:
-    case GGML_TYPE_Q5_K:
-    case GGML_TYPE_Q6_K:
-    case GGML_TYPE_IQ2_XXS:
-    case GGML_TYPE_IQ2_XS:
-    case GGML_TYPE_IQ3_XXS:
-    case GGML_TYPE_IQ1_S:
-    case GGML_TYPE_IQ4_NL:
-    case GGML_TYPE_IQ3_S:
-    case GGML_TYPE_IQ2_S:
-    case GGML_TYPE_IQ4_XS:
-    case GGML_TYPE_IQ1_M:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool is_legacy_mmq_type(int64_t type) {
-  switch (type) {
-    case GGML_TYPE_Q4_0:
-    case GGML_TYPE_Q4_1:
-    case GGML_TYPE_Q5_0:
-    case GGML_TYPE_Q5_1:
-    case GGML_TYPE_Q8_0:
-    case GGML_TYPE_Q2_K:
-    case GGML_TYPE_Q3_K:
-    case GGML_TYPE_Q4_K:
-    case GGML_TYPE_Q5_K:
-    case GGML_TYPE_Q6_K:
-      return true;
-    default:
-      return false;
-  }
 }
 
 // Dense-only dispatch into the upstream MMQ template instances.
@@ -388,49 +306,9 @@ Tensor run_selected_dense(const Tensor& W, const Tensor& X, int64_t type,
   return run_upstream_blas(W, X, type, row, k);
 }
 
-Tensor run_dense_entry(Tensor W, Tensor X, int64_t type, int64_t row,
-                       bool vector_entry, const char* op_name) {
-  check_dense_inputs(W, X, row, op_name, /*packed_weight=*/true);
-  if (X.size(0) == 0) {
-    return torch::stable::new_empty(W, {0, row}, X.scalar_type());
-  }
-
-  const KernelMode mode = kernel_mode();
-  if (mode == KernelMode::kTriton) {
-    throw std::runtime_error(
-        std::string(op_name) +
-        ": Triton backend selected; use the Python dispatcher");
-  }
-  const bool legacy_available =
-      vector_entry ? is_legacy_mmvq_type(type) : is_legacy_mmq_type(type);
-  const char* legacy_name = vector_entry ? "MMVQ" : "MMQ";
-  if (mode == KernelMode::kLegacy) {
-    STD_TORCH_CHECK(legacy_available, op_name, ": no legacy ", legacy_name,
-                    " kernel for quantization type ", type);
-    return vector_entry ? ggml_mul_mat_vec_a8_legacy(W, X, type, row)
-                        : ggml_mul_mat_a8_legacy(W, X, type, row);
-  }
-
-  if (is_upstream_weight_type(type)) {
-    return run_selected_dense(W, X, type, row,
-                              vector_entry ? kDenseMmvq : kDenseMmq, op_name);
-  }
-  if (mode == KernelMode::kUpstream) {
-    STD_TORCH_CHECK(false, op_name,
-                    ": no upstream CUDA path for quantization type ", type);
-  }
-  if (legacy_available) {
-    return vector_entry ? ggml_mul_mat_vec_a8_legacy(W, X, type, row)
-                        : ggml_mul_mat_a8_legacy(W, X, type, row);
-  }
-  throw std::runtime_error(std::string(op_name) +
-                           ": no eligible CUDA kernel for quantization type " +
-                           std::to_string(type));
-}
-
 Tensor run_explicit_dense(Tensor W, Tensor X, int64_t type, int64_t row,
                           int64_t route, const char* name) {
-  check_dense_inputs(W, X, row, name, /*packed_weight=*/false);
+  check_dense_inputs(W, X, row, name);
   if (X.size(0) == 0) {
     return torch::stable::new_empty(X, {0, row}, X.scalar_type());
   }
@@ -446,14 +324,6 @@ bool ggml_should_use_mmvq(int64_t type, int64_t cc, int64_t batch) {
          cc <= std::numeric_limits<int>::max() &&
          ggml_cuda_should_use_mmvq(static_cast<ggml_type>(type),
                                    static_cast<int>(cc), batch);
-}
-
-Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_dense_entry(W, X, type, row, true, "ggml_mul_mat_vec_a8");
-}
-
-Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_dense_entry(W, X, type, row, false, "ggml_mul_mat_a8");
 }
 
 int64_t ggml_dense_upstream_capabilities(Tensor W, Tensor X, int64_t type,

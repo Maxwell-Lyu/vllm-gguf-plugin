@@ -22,8 +22,9 @@ Tensor ggml_dense_blas(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_dequantize_upstream(Tensor W, int64_t type, int64_t m, int64_t n,
                                 std::optional<ScalarType> dtype);
 #endif
-Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row);
-Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row);
+Tensor ggml_mul_mat_vec_a8_legacy(Tensor W, Tensor X, int64_t type,
+                                  int64_t row);
+Tensor ggml_mul_mat_a8_legacy(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
                    Tensor expert_ids, Tensor num_tokens_post_padded,
                    int64_t type, int64_t row, int64_t top_k, int64_t tokens);
@@ -95,8 +96,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dense_mmf", TORCH_BOX(&ggml_dense_mmf));
   ops.impl("ggml_dense_blas", TORCH_BOX(&ggml_dense_blas));
 #endif
-  ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
-  ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
+  // Keep the historical op names as fixed legacy entry points. Python selects
+  // explicit upstream ops before crossing the Torch/C++ boundary.
+  ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8_legacy));
+  ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8_legacy));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
 #ifndef VLLM_GGUF_LEGACY_ONLY

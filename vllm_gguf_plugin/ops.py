@@ -180,34 +180,9 @@ def _cuda_kernel_available(op_name: str, quant_type: int | None = None) -> bool:
     )
 
 
-def _cuda_gemm_kernel_available(op_name: str, quant_type: int) -> bool:
-    if not _cuda_kernel_available(op_name):
-        return False
-    mode = cuda_dense_kernel_mode()
-    if mode == "triton":
-        return False
-    backend = (
-        QuantizationBackend.UPSTREAM
-        if mode in {"upstream", "auto"}
-        else QuantizationBackend.LEGACY
-    )
-    operation = (
-        QuantizationOperation.DEQUANTIZE
-        if backend == QuantizationBackend.UPSTREAM
-        else QuantizationOperation.MMQ
-    )
-    return supports(quant_type, backend, operation)
-
-
-def _cuda_moe_kernel_available(op_name: str, quant_type: int) -> bool:
-    mode = cuda_moe_kernel_mode()
-    if mode == "triton":
-        return False
-    operation = (
-        QuantizationOperation.MMQ
-        if op_name in {"ggml_moe_a8", "ggml_moe_get_block_size"}
-        else QuantizationOperation.MMVQ
-    )
+def _cuda_legacy_moe_available(
+    op_name: str, quant_type: int, operation: QuantizationOperation
+) -> bool:
     return _cuda_kernel_available(op_name) and supports(
         quant_type, QuantizationBackend.LEGACY, operation
     )
@@ -416,31 +391,28 @@ def ggml_mul_mat_vec_a8(
     quant_type: int,
     row: int,
 ) -> torch.Tensor:
+    # The raw Torch op with this name is a fixed legacy entry point. Choose
+    # the upstream op here so C++ never performs a second backend selection.
     mode = cuda_dense_kernel_mode()
-    upstream_available = _cuda_upstream_supports(
-        "ggml_mul_mat_vec_a8", quant_type, QuantizationOperation.MMVQ
-    )
-    legacy_available = _cuda_kernel_available("ggml_mul_mat_vec_a8", quant_type)
-    triton_available = supports(
+    if mode in {"upstream", "auto"}:
+        if _cuda_upstream_supports(
+            "ggml_dense_mmvq", quant_type, QuantizationOperation.MMVQ
+        ):
+            return ggml_dense_mmvq(W, X, quant_type, row)
+        if mode == "upstream":
+            _raise_backend_unavailable(mode, "MMVQ", quant_type)
+
+    if mode in {"legacy", "auto"}:
+        if _cuda_kernel_available("ggml_mul_mat_vec_a8", quant_type):
+            return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
+        if mode == "legacy":
+            _raise_backend_unavailable(mode, "MMVQ", quant_type)
+
+    if mode in {"triton", "auto"} and supports(
         quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMVQ
-    )
-    if mode == "upstream":
-        if not upstream_available:
-            _raise_backend_unavailable("upstream", "MMVQ", quant_type)
-        return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
-    if mode == "legacy":
-        if not legacy_available:
-            _raise_backend_unavailable("legacy", "MMVQ", quant_type)
-        return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
-    if mode == "triton":
-        if not triton_available:
-            _raise_backend_unavailable("triton", "MMVQ", quant_type)
+    ):
         return ggml_mul_mat_a8_triton(W, X, quant_type, row)
-    if upstream_available or legacy_available:
-        return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
-    if triton_available:
-        return ggml_mul_mat_a8_triton(W, X, quant_type, row)
-    _raise_backend_unavailable("auto", "MMVQ", quant_type)
+    _raise_backend_unavailable(mode, "MMVQ", quant_type)
 
 
 def ggml_mul_mat_a8(
@@ -449,35 +421,42 @@ def ggml_mul_mat_a8(
     quant_type: int,
     row: int,
 ) -> torch.Tensor:
+    # Keep MMQ versus BLAS selection in Python; the raw Torch op is legacy.
     mode = cuda_dense_kernel_mode()
-    upstream_available = _cuda_upstream_supports(
-        "ggml_mul_mat_a8", quant_type, QuantizationOperation.DEQUANTIZE
-    )
-    legacy_available = supports(
-        quant_type, QuantizationBackend.LEGACY, QuantizationOperation.MMQ
-    ) and _cuda_kernel_available("ggml_mul_mat_a8")
-    triton_available = supports(
-        quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMQ
-    ) or supports(
-        quant_type, QuantizationBackend.TRITON, QuantizationOperation.DEQUANTIZE
-    )
-    if mode == "upstream":
-        if not upstream_available:
-            _raise_backend_unavailable("upstream", "MMQ", quant_type)
-        return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
-    if mode == "legacy":
-        if not legacy_available:
-            _raise_backend_unavailable("legacy", "MMQ", quant_type)
-        return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
-    if mode == "triton":
-        if not triton_available:
-            _raise_backend_unavailable("triton", "MMQ", quant_type)
+    if mode in {"upstream", "auto"}:
+        if _cuda_upstream_supports(
+            "ggml_dense_upstream_capabilities",
+            quant_type,
+            QuantizationOperation.DEQUANTIZE,
+        ):
+            caps = dense_upstream_capabilities(W, X, quant_type, row)
+            if caps & DENSE_MMQ:
+                return ggml_dense_mmq(W, X, quant_type, row)
+            if caps & DENSE_BLAS:
+                return ggml_dense_blas(W, X, quant_type, row)
+            # The upstream backend exists, but these inputs have no valid route.
+            _raise_backend_unavailable("upstream", "MMQ/BLAS", quant_type)
+        if mode == "upstream":
+            _raise_backend_unavailable(mode, "MMQ", quant_type)
+
+    if mode in {"legacy", "auto"}:
+        if supports(
+            quant_type, QuantizationBackend.LEGACY, QuantizationOperation.MMQ
+        ) and _cuda_kernel_available("ggml_mul_mat_a8"):
+            return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
+        if mode == "legacy":
+            _raise_backend_unavailable(mode, "MMQ", quant_type)
+
+    if mode in {"triton", "auto"} and (
+        supports(quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMQ)
+        or supports(
+            quant_type,
+            QuantizationBackend.TRITON,
+            QuantizationOperation.DEQUANTIZE,
+        )
+    ):
         return ggml_mul_mat_a8_triton(W, X, quant_type, row)
-    if upstream_available or legacy_available:
-        return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
-    if triton_available:
-        return ggml_mul_mat_a8_triton(W, X, quant_type, row)
-    _raise_backend_unavailable("auto", "MMQ", quant_type)
+    _raise_backend_unavailable(mode, "MMQ", quant_type)
 
 
 def cuda_moe_upstream_kernel_available(quant_type: int) -> bool:
@@ -527,48 +506,40 @@ def ggml_moe_a8(
     tokens: int,
 ) -> torch.Tensor:
     mode = cuda_moe_kernel_mode()
-    legacy_available = _cuda_moe_kernel_available("ggml_moe_a8", quant_type)
     if mode == "upstream":
-        _raise_backend_unavailable("upstream", "MoE MMQ", quant_type)
-    if mode == "legacy":
-        if not legacy_available:
-            _raise_backend_unavailable("legacy", "MoE MMQ", quant_type)
-        return torch.ops._C_gguf.ggml_moe_a8(
-            X,
-            W,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            quant_type,
-            row,
-            top_k,
-            tokens,
-        )
-    if mode == "auto" and legacy_available:
-        return torch.ops._C_gguf.ggml_moe_a8(
-            X,
-            W,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            quant_type,
-            row,
-            top_k,
-            tokens,
-        )
-    if not supports(quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMQ):
         _raise_backend_unavailable(mode, "MoE MMQ", quant_type)
-    return ggml_moe_a8_triton(
-        X,
-        W,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        quant_type,
-        row,
-        top_k,
-        tokens,
-    )
+
+    if mode in {"legacy", "auto"}:
+        if _cuda_legacy_moe_available(
+            "ggml_moe_a8", quant_type, QuantizationOperation.MMQ
+        ):
+            return torch.ops._C_gguf.ggml_moe_a8(
+                X,
+                W,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                quant_type,
+                row,
+                top_k,
+                tokens,
+            )
+        if mode == "legacy":
+            _raise_backend_unavailable(mode, "MoE MMQ", quant_type)
+
+    if supports(quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMQ):
+        return ggml_moe_a8_triton(
+            X,
+            W,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            quant_type,
+            row,
+            top_k,
+            tokens,
+        )
+    _raise_backend_unavailable(mode, "MoE MMQ", quant_type)
 
 
 def ggml_moe_a8_vec(
@@ -581,50 +552,52 @@ def ggml_moe_a8_vec(
     tokens: int,
 ) -> torch.Tensor:
     mode = cuda_moe_kernel_mode()
-    legacy_available = _cuda_moe_kernel_available("ggml_moe_a8_vec", quant_type)
     if mode == "upstream":
-        _raise_backend_unavailable("upstream", "MoE MMVQ", quant_type)
-    if mode == "legacy":
-        if not legacy_available:
-            _raise_backend_unavailable("legacy", "MoE MMVQ", quant_type)
-        return torch.ops._C_gguf.ggml_moe_a8_vec(
-            X, W, topk_ids, top_k, quant_type, row, tokens
-        )
-    if mode == "auto" and legacy_available:
-        return torch.ops._C_gguf.ggml_moe_a8_vec(
-            X, W, topk_ids, top_k, quant_type, row, tokens
-        )
-    if not supports(quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMVQ):
         _raise_backend_unavailable(mode, "MoE MMVQ", quant_type)
-    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
-    E = W.shape[0]
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, get_triton_moe_block_m(quant_type), E
-    )
-    return ggml_moe_a8_triton(
-        X,
-        W,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        quant_type,
-        row,
-        top_k,
-        tokens,
-    )
+    if mode in {"legacy", "auto"}:
+        if _cuda_legacy_moe_available(
+            "ggml_moe_a8_vec", quant_type, QuantizationOperation.MMVQ
+        ):
+            return torch.ops._C_gguf.ggml_moe_a8_vec(
+                X, W, topk_ids, top_k, quant_type, row, tokens
+            )
+        if mode == "legacy":
+            _raise_backend_unavailable(mode, "MoE MMVQ", quant_type)
+
+    if supports(quant_type, QuantizationBackend.TRITON, QuantizationOperation.MMVQ):
+        from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+        E = W.shape[0]
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, get_triton_moe_block_m(quant_type), E
+        )
+        return ggml_moe_a8_triton(
+            X,
+            W,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            quant_type,
+            row,
+            top_k,
+            tokens,
+        )
+    _raise_backend_unavailable(mode, "MoE MMVQ", quant_type)
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:
     mode = cuda_moe_kernel_mode()
     if mode == "upstream":
-        _raise_backend_unavailable("upstream", "MoE block-size", quant_type)
-    if mode in {"legacy", "auto"} and _cuda_moe_kernel_available(
-        "ggml_moe_get_block_size", quant_type
-    ):
-        return torch.ops._C_gguf.ggml_moe_get_block_size(quant_type)
-    if mode == "legacy":
-        _raise_backend_unavailable("legacy", "MoE block-size", quant_type)
+        _raise_backend_unavailable(mode, "MoE block-size", quant_type)
+    if mode in {"legacy", "auto"}:
+        if _cuda_legacy_moe_available(
+            "ggml_moe_get_block_size", quant_type, QuantizationOperation.MMQ
+        ):
+            return torch.ops._C_gguf.ggml_moe_get_block_size(quant_type)
+        if mode == "legacy":
+            _raise_backend_unavailable(mode, "MoE block-size", quant_type)
+    # This helper describes Triton's layout; the caller checks kernel support.
     return get_triton_moe_block_m(quant_type)
 
 
