@@ -1,7 +1,6 @@
 """Shared helpers for upstream CUDA kernel tests.
 
-Everything that used to live in the phase0/phase2_3/regression test files and
-is reused across the reorganized suites lives here:
+The helpers cover:
 
 - ``TEMPLATE_EXTRA_TYPES``: optional quant types that only exist on newer
   ``gguf`` releases (Q1_0, Q2_0, MXFP4, NVFP4).
