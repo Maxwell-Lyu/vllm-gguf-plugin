@@ -32,6 +32,7 @@ UPSTREAM_METADATA = tomllib.loads(UPSTREAM_METADATA_FILE.read_text())
 UPSTREAM_COMMIT = UPSTREAM_METADATA["commit"]
 UPSTREAM_CUDA_ROOT = UPSTREAM_ROOT / "ggml" / "src" / "ggml-cuda"
 UPSTREAM_LICENSE = UPSTREAM_ROOT / "LICENSE"
+DISTRIBUTED_UPSTREAM_LICENSE = pathlib.Path("LICENSES/llama.cpp-MIT.txt")
 UPSTREAM_SOURCES = [
     UPSTREAM_ROOT / relative_path for relative_path in UPSTREAM_METADATA["sources"]
 ]
@@ -48,6 +49,11 @@ def _check_upstream_checkout() -> None:
         raise RuntimeError(
             "llama.cpp source files are missing. Initialize the pinned submodule with "
             "`git submodule update --init --recursive`, then rebuild."
+        )
+    if UPSTREAM_LICENSE.read_bytes() != DISTRIBUTED_UPSTREAM_LICENSE.read_bytes():
+        raise RuntimeError(
+            "The distributed llama.cpp license does not match the pinned submodule. "
+            "Review the upstream license and update LICENSES/llama.cpp-MIT.txt."
         )
 
     # Keep the source closure complete as upstream adds quantized MMQ instances.

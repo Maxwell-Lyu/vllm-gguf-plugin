@@ -149,3 +149,9 @@ to the corresponding Hugging Face model. A model appearing in vLLM's general
 supported-model list does not by itself guarantee GGUF compatibility. When
 reporting an unsupported model, include the model repository, quantization,
 plugin and vLLM versions, and the complete weight-mapping error.
+
+## License
+
+This project is licensed under Apache-2.0. It includes and derives portions
+from llama.cpp and GGML under the MIT License. See `THIRD_PARTY_NOTICES.md` and
+`LICENSES/llama.cpp-MIT.txt` for attribution and the complete license text.
