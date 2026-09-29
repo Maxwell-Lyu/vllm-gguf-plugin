@@ -73,6 +73,16 @@ vllm serve unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M \
 For a GGUF without a `nextn` block, omit `--speculative-config`; the backbone
 loads normally without MTP.
 
+When the `nextn` block is in a separate GGUF, pass that file as the speculative
+model. The draft uses the target model's Hugging Face config and loads only the
+MTP block from the separate file:
+
+```bash
+vllm serve /path/to/Qwen3.8-27B-Q4_0.gguf \
+  --tokenizer /path/to/Qwen3.8-27B \
+  --speculative-config '{"method":"mtp","model":"/path/to/mtp-Qwen3.8-27B-Q4_0.gguf","num_speculative_tokens":1}'
+```
+
 ## Kernel backend selection
 
 On CUDA builds the plugin ships three kernel implementations for GGUF
