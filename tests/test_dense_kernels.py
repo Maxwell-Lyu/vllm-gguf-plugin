@@ -279,31 +279,51 @@ def test_dense_iq1_m_blas_nondefault_stream_and_graph(monkeypatch):
 @cuda_mark
 @torch.inference_mode()
 @pytest.mark.parametrize(
-    "dtype,quant_type",
+    "dtype,quant_type,atol",
     [
-        (torch.float32, Q.F32),
-        (torch.float16, Q.F16),
-        (torch.bfloat16, Q.BF16),
+        (torch.float32, Q.F32, 1e-5),
+        (torch.float16, Q.F16, 2e-3),
+        (torch.bfloat16, Q.BF16, 2e-2),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 5, 17])
-def test_float_dense_upstream_dispatch(monkeypatch, dtype, quant_type, batch):
+@pytest.mark.parametrize(
+    "batch,rows,k", [(1, 37, 258), (5, 64, 256), (9, 64, 256), (17, 64, 256)]
+)
+def test_float_dense_upstream_dispatch(
+    monkeypatch, dtype, quant_type, atol, batch, rows, k
+):
     from vllm_gguf_plugin import ops
     from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", "upstream")
-    w = torch.randn((64, 256), device="cuda", dtype=dtype) * 0.1
-    x = torch.randn((batch, 256), device="cuda", dtype=dtype) * 0.1
-    caps = ops.dense_upstream_capabilities(w, x, int(quant_type), 64)
+    torch.manual_seed(20260929)
+    w = torch.randn((rows, k), device="cuda", dtype=dtype) * 0.1
+    x = torch.randn((batch, k), device="cuda", dtype=dtype) * 0.1
+    caps = ops.dense_upstream_capabilities(w, x, int(quant_type), rows)
+    if batch == 1:
+        # The odd row count and K=258 rule out MMF, while MMVF handles tails.
+        assert caps & ops.DENSE_MMVF
+        assert not caps & ops.DENSE_MMF
+    elif batch == 9 and torch.version.hip is None:
+        assert not caps & ops.DENSE_MMVF
+        major, _ = torch.cuda.get_device_capability()
+        required_major = 7 if dtype == torch.float16 else 8
+        assert bool(caps & ops.DENSE_MMF) == (major >= required_major)
+    elif batch == 17:
+        assert not caps & (ops.DENSE_MMVF | ops.DENSE_MMF)
     if caps & ops.DENSE_MMVF:
-        expected = torch.ops._C_gguf.ggml_dense_mmvf(w, x, int(quant_type), 64)
+        expected = torch.ops._C_gguf.ggml_dense_mmvf(w, x, int(quant_type), rows)
     elif caps & ops.DENSE_MMF:
-        expected = torch.ops._C_gguf.ggml_dense_mmf(w, x, int(quant_type), 64)
+        expected = torch.ops._C_gguf.ggml_dense_mmf(w, x, int(quant_type), rows)
     else:
         expected = x @ w.T
     actual = _fused_mul_mat_gguf(x, w, int(quant_type))
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(actual, x @ w.T, atol=0.08, rtol=0.08)
+    # Ampere's F32 MMF uses TF32 tensor-core instructions.
+    reference_atol = 5e-3 if dtype == torch.float32 and caps & ops.DENSE_MMF else atol
+    torch.testing.assert_close(
+        actual, (x.float() @ w.float().T).to(dtype), atol=reference_atol, rtol=0
+    )
 
 
 @cuda_mark

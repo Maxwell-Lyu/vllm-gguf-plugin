@@ -116,21 +116,41 @@ def test_moe_process_weights_after_loading_pads_3d_weights():
 @cuda_mark
 @torch.inference_mode()
 @pytest.mark.parametrize(
-    "dtype,quant_type,atol,rtol",
+    "dtype,quant_type,atol",
     [
-        (torch.float32, Q.F32, 1e-3, 1e-3),
-        (torch.float16, Q.F16, 0.06, 0.06),
-        (torch.bfloat16, Q.BF16, 0.15, 0.15),
+        (torch.float32, Q.F32, 1e-5),
+        (torch.float16, Q.F16, 2e-3),
+        (torch.bfloat16, Q.BF16, 2e-2),
     ],
 )
-def test_moe_float_mmvf_reference(dtype, quant_type, atol, rtol):
+@pytest.mark.parametrize("route,tokens", [("mmvf", 1), ("mmf", 9)])
+def test_moe_float_mmvf_mmf_reference(dtype, quant_type, atol, route, tokens):
     import vllm_gguf_plugin._C_gguf  # noqa: F401
 
-    experts, rows, k, tokens, top_k = 3, 64, 256, 2, 2
+    experts, top_k = 3, 2
+    rows, k = (37, 258) if route == "mmvf" else (64, 256)
     torch.manual_seed(25)
     weight = torch.randn((experts, rows, k), device="cuda", dtype=dtype) * 0.1
     x = torch.randn((tokens, k), device="cuda", dtype=dtype) * 0.1
-    ids = torch.tensor([[0, 2], [1, 0]], device="cuda", dtype=torch.int32)
+    ids = torch.tensor(
+        [[t % experts, (t + 1) % experts] for t in range(tokens)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    if route == "mmf" and torch.version.hip is not None:
+        pytest.skip("NVIDIA MMF architecture expectation")
+    if route == "mmf":
+        major, _ = torch.cuda.get_device_capability()
+        required_major = 7 if dtype == torch.float16 else 8
+        if major < required_major:
+            from vllm_gguf_plugin.kernel_support import MOE_NOT_ELIGIBLE_MARKER
+
+            with pytest.raises(RuntimeError, match=MOE_NOT_ELIGIBLE_MARKER):
+                torch.ops._C_gguf.ggml_moe_upstream(
+                    x, weight, ids, int(quant_type), rows, top_k, tokens
+                )
+            return
 
     output = torch.ops._C_gguf.ggml_moe_upstream(
         x, weight, ids, int(quant_type), rows, top_k, tokens
@@ -143,7 +163,9 @@ def test_moe_float_mmvf_reference(dtype, quant_type, atol, rtol):
         ]
     ).to(dtype)
     assert output.shape == (tokens * top_k, rows)
-    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+    # Ampere's F32 MMF uses TF32 tensor-core instructions.
+    reference_atol = 5e-3 if dtype == torch.float32 and route == "mmf" else atol
+    torch.testing.assert_close(output, reference, atol=reference_atol, rtol=0)
 
 
 @cuda_mark
