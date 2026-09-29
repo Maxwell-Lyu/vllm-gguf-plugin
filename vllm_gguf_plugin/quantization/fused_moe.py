@@ -4,6 +4,7 @@
 from functools import partial
 
 import torch
+from gguf import GGMLQuantizationType as WeightType
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
 )
@@ -35,6 +36,7 @@ from .params import (
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
     _materialize_upstream_moe_storage_padding,
+    _store_gguf_weight_type,
 )
 from .utils import logger
 
@@ -70,24 +72,11 @@ def _fused_moe_gguf(
         and ops.cuda_moe_upstream_kernel_available(weight_type)
         and ops.cuda_moe_upstream_kernel_available(weight_type2)
     )
-    upstream_only_types = (
-        supports(
-            weight_type,
-            QuantizationBackend.UPSTREAM,
-            QuantizationOperation.DEQUANTIZE,
-        )
-        and not supports(
-            weight_type, QuantizationBackend.LEGACY, QuantizationOperation.MMVQ
-        )
-    ) or (
-        supports(
-            weight_type2,
-            QuantizationBackend.UPSTREAM,
-            QuantizationOperation.DEQUANTIZE,
-        )
-        and not supports(
-            weight_type2, QuantizationBackend.LEGACY, QuantizationOperation.MMVQ
-        )
+    upstream_only_types = any(
+        supports_moe(quant_type, QuantizationBackend.UPSTREAM)
+        and not supports_moe(quant_type, QuantizationBackend.LEGACY)
+        and not supports_moe(quant_type, QuantizationBackend.TRITON)
+        for quant_type in (weight_type, weight_type2)
     )
 
     def fallback_supports(quant_type: int, operation: QuantizationOperation) -> bool:
@@ -288,7 +277,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        del params_dtype
         base_weight_loader = extra_weight_attrs.pop("weight_loader")
         tensor_shape = (num_experts, 2 * intermediate_size_per_partition, hidden_size)
         w13_weight = GGUFUninitializedWeightParameter(requires_grad=False)
@@ -296,7 +284,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             w13_weight,
             {
                 "weight_loader": partial(
-                    _gguf_moe_weight_loader, layer, base_weight_loader
+                    _gguf_moe_weight_loader,
+                    layer,
+                    base_weight_loader,
+                    params_dtype=params_dtype,
                 ),
                 "input_dim": 1,
                 "output_dim": 0,
@@ -327,7 +318,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             w2_weight,
             {
                 "weight_loader": partial(
-                    _gguf_moe_weight_loader, layer, base_weight_loader
+                    _gguf_moe_weight_loader,
+                    layer,
+                    base_weight_loader,
+                    params_dtype=params_dtype,
                 ),
                 "input_dim": 1,
                 "output_dim": 0,
@@ -353,19 +347,27 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_type", w2_weight_type)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Reserve the upstream MATRIX_ROW_PADDING storage tail on MoE weights.
+        """Finalize floating types and upstream storage on MoE weights.
 
-        Runs after every expert shard is loaded. The upstream MoE kernels
-        validate the trailing storage at launch time, and the per-shard
-        loader only pads 2D dense weights, so the 3D MoE parameters are
-        padded here using each parameter's quantization type.
+        Align each floating type marker with the loaded tensor's dtype and
+        reserve the trailing storage required by upstream MoE kernels.
         """
-        _materialize_upstream_moe_storage_padding(
-            layer.w13_weight, layer.w13_weight_type.weight_type
-        )
-        _materialize_upstream_moe_storage_padding(
-            layer.w2_weight, layer.w2_weight_type.weight_type
-        )
+        float_types = {
+            torch.float32: int(WeightType.F32),
+            torch.float16: int(WeightType.F16),
+            torch.bfloat16: int(WeightType.BF16),
+        }
+        for weight_name in ("w13_weight", "w2_weight"):
+            weight = getattr(layer, weight_name)
+            type_param = getattr(layer, f"{weight_name}_type")
+            if weight.dtype in float_types:
+                # The GGUF iterator skips floating weight_type entries, so
+                # their default F32 marker can disagree with the tensor.
+                weight_type = float_types[weight.dtype]
+                _store_gguf_weight_type(
+                    type_param, torch.tensor(weight_type, dtype=torch.uint8)
+                )
+            _materialize_upstream_moe_storage_padding(weight, type_param.weight_type)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

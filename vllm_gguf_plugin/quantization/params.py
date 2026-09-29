@@ -285,7 +285,13 @@ def _gguf_moe_weight_loader(
     shard_id: str,
     expert_id: int,
     return_success: bool = False,
+    *,
+    params_dtype: torch.dtype,
 ) -> bool | None:
+    # GGUF floating expert tensors may use a different dtype from the model's
+    # activations. Convert once before allocating the destination parameter.
+    if loaded_weight.is_floating_point():
+        loaded_weight = loaded_weight.to(dtype=params_dtype)
     _materialize_gguf_moe_param(layer, param, loaded_weight, shard_id)
     return base_weight_loader(
         param,

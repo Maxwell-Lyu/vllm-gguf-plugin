@@ -7,8 +7,15 @@
 #include "mmf.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <limits>
 #include <torch/csrc/stable/ops.h>
+
+int64_t ggml_dense_upstream_capabilities(Tensor W, Tensor X, int64_t type,
+                                         int64_t row);
+Tensor ggml_dense_mmvq(Tensor W, Tensor X, int64_t type, int64_t row);
+Tensor ggml_dense_mmq(Tensor W, Tensor X, int64_t type, int64_t row);
+Tensor ggml_dense_blas(Tensor W, Tensor X, int64_t type, int64_t row);
 
 namespace {
 // Shared with kernel_support.py; auto mode recognizes this exact marker.
@@ -80,6 +87,140 @@ int64_t checked_moe_product(int64_t lhs, int64_t rhs, const char* name) {
   return lhs * rhs;
 }
 
+template <typename T>
+__global__ void gather_moe_routes(T* sorted, const T* input,
+                                  const int32_t* routes, int64_t total,
+                                  int64_t top_k, int64_t k) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < total * k) {
+    const int64_t route = index / k;
+    sorted[index] = input[(routes[route] / top_k) * k + index % k];
+  }
+}
+
+template <typename T>
+__global__ void scatter_moe_routes(T* output, const T* sorted,
+                                   const int32_t* routes, int64_t total,
+                                   int64_t row) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < total * row) {
+    output[static_cast<int64_t>(routes[index / row]) * row + index % row] =
+        sorted[index];
+  }
+}
+
+Tensor run_grouped_dense(const Tensor& W, const Tensor& X, int64_t type,
+                         int64_t row) {
+  const int64_t caps = ggml_dense_upstream_capabilities(W, X, type, row);
+  if (X.size(0) >= MMQ_DP4A_MAX_BATCH_SIZE && (caps & 16)) {
+    return ggml_dense_blas(W, X, type, row);
+  }
+  // Match the dense dispatch order used by the public Python selector.
+  if (caps & 4) {
+    return ggml_dense_mmvq(W, X, type, row);
+  }
+  if (caps & 8) {
+    return ggml_dense_mmq(W, X, type, row);
+  }
+  STD_TORCH_CHECK(caps & 16, kMoeNotEligibleMarker,
+                  ": grouped expert has no dense CUDA route");
+  return ggml_dense_blas(W, X, type, row);
+}
+
+Tensor run_upstream_moe_grouped(const Tensor& W, const Tensor& X,
+                                const Tensor& topk_ids, int64_t type,
+                                int64_t row, int64_t top_k, int64_t tokens,
+                                int64_t k, cudaStream_t stream) {
+  const int64_t total = tokens * top_k;
+  STD_TORCH_CHECK(total <= INT_MAX, kMoeNotEligibleMarker,
+                  ": too many routed tokens for int32 indices");
+  const int64_t experts = W.size(0);
+  std::vector<int32_t> ids(total);
+  STD_TORCH_CHECK(
+      cudaMemcpyAsync(ids.data(), topk_ids.data_ptr(), total * sizeof(int32_t),
+                      cudaMemcpyDeviceToHost, stream) == cudaSuccess,
+      "upstream MoE could not read expert indices");
+  STD_TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess,
+                  "upstream MoE could not synchronize expert indices");
+
+  std::vector<std::vector<int32_t>> by_expert(experts);
+  for (int64_t route = 0; route < total; ++route) {
+    STD_TORCH_CHECK(ids[route] >= 0 && ids[route] < experts,
+                    "upstream MoE expert index out of range");
+    by_expert[ids[route]].push_back(static_cast<int32_t>(route));
+  }
+  std::vector<int32_t> routes;
+  routes.reserve(total);
+  for (const auto& expert_routes : by_expert) {
+    routes.insert(routes.end(), expert_routes.begin(), expert_routes.end());
+  }
+  Tensor device_routes =
+      torch::stable::new_empty(topk_ids, {total}, ScalarType::Int);
+  STD_TORCH_CHECK(
+      cudaMemcpyAsync(device_routes.data_ptr(), routes.data(),
+                      total * sizeof(int32_t), cudaMemcpyHostToDevice,
+                      stream) == cudaSuccess,
+      "upstream MoE could not upload sorted expert indices");
+  STD_TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess,
+                  "upstream MoE could not finish uploading expert indices");
+
+  Tensor sorted_input =
+      torch::stable::new_empty(X, {total, k}, X.scalar_type());
+  const int input_grid = static_cast<int>((total * k + 255) / 256);
+  if (X.element_size() == sizeof(float)) {
+    gather_moe_routes<<<input_grid, 256, 0, stream>>>(
+        static_cast<uint32_t*>(sorted_input.data_ptr()),
+        static_cast<const uint32_t*>(X.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, top_k, k);
+  } else {
+    gather_moe_routes<<<input_grid, 256, 0, stream>>>(
+        static_cast<uint16_t*>(sorted_input.data_ptr()),
+        static_cast<const uint16_t*>(X.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, top_k, k);
+  }
+  check_launch("upstream MoE gather");
+
+  Tensor sorted_output =
+      torch::stable::new_empty(X, {total, row}, X.scalar_type());
+  int64_t first = 0;
+  for (int64_t expert = 0; expert < experts; ++expert) {
+    const int64_t count = by_expert[expert].size();
+    if (count == 0) {
+      continue;
+    }
+    Tensor expert_weight = torch::stable::select(W, 0, expert);
+    Tensor expert_input = torch::stable::narrow(sorted_input, 0, first, count);
+    Tensor expert_output =
+        run_grouped_dense(expert_weight, expert_input, type, row);
+    auto* destination = static_cast<char*>(sorted_output.data_ptr()) +
+                        first * row * X.element_size();
+    STD_TORCH_CHECK(
+        cudaMemcpyAsync(destination, expert_output.data_ptr(),
+                        count * row * X.element_size(),
+                        cudaMemcpyDeviceToDevice, stream) == cudaSuccess,
+        "upstream MoE could not copy expert output");
+    first += count;
+  }
+
+  Tensor output = torch::stable::new_empty(X, {total, row}, X.scalar_type());
+  const int output_grid = static_cast<int>((total * row + 255) / 256);
+  if (X.element_size() == sizeof(float)) {
+    scatter_moe_routes<<<output_grid, 256, 0, stream>>>(
+        static_cast<uint32_t*>(output.data_ptr()),
+        static_cast<const uint32_t*>(sorted_output.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, row);
+  } else {
+    scatter_moe_routes<<<output_grid, 256, 0, stream>>>(
+        static_cast<uint16_t*>(output.data_ptr()),
+        static_cast<const uint16_t*>(sorted_output.data_ptr()),
+        static_cast<const int32_t*>(device_routes.data_ptr()), total, row);
+  }
+  check_launch("upstream MoE scatter");
+  return output;
+}
+
 // mmid.cu stores one 4-byte mm_ids_helper_store per token in dynamic shared
 // memory. Its token index also has a 22-bit limit.
 int64_t mmid_max_tokens(size_t smpbo) {
@@ -87,11 +228,20 @@ int64_t mmid_max_tokens(size_t smpbo) {
       std::min<size_t>(smpbo / sizeof(int32_t), (1u << 22) - 1));
 }
 
-enum class MoeKernel { kMmvq, kMmq, kMmqChunks, kIq1MChunks, kMmvf, kMmf };
+enum class MoeKernel {
+  kMmvq,
+  kMmq,
+  kMmvf,
+  kMmf,
+  kMmfChunks,
+};
+
+constexpr int64_t kMmvqMaxRoutes = 1024;
+constexpr int64_t kGroupedTokenThreshold = 8192;
 
 MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
-                            int64_t tokens, int cc, int warp_size, size_t smpbo,
-                            int* mmvq_max) {
+                            int64_t top_k, int64_t tokens, int cc,
+                            int warp_size, size_t smpbo, int64_t* chunk_size) {
   const auto ggml_type = static_cast<enum ggml_type>(type);
   if (is_upstream_float_type(type)) {
     const ggml_tensor weight = make_moe_float_weight_tensor(W, type);
@@ -104,29 +254,55 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
                                   tokens)) {
       return MoeKernel::kMmvf;
     }
-    if (ggml_cuda_should_use_mmf(ggml_type, cc, warp_size, weight.ne, weight.nb,
-                                 tokens, /*mul_mat_id=*/true)) {
+    const int64_t max_tokens = std::min(tokens, mmid_max_tokens(smpbo));
+    const auto mmf_eligible = [&](int64_t count) {
+      return ggml_cuda_should_use_mmf(ggml_type, cc, warp_size, weight.ne,
+                                      weight.nb, count, /*mul_mat_id=*/true);
+    };
+    if (tokens <= max_tokens && mmf_eligible(tokens)) {
       return MoeKernel::kMmf;
+    }
+    if (max_tokens > 0 && mmf_eligible(1)) {
+      // The upstream MoE MMF predicate has a monotone token limit. Find its
+      // largest safe batch without duplicating the upstream shape thresholds.
+      int64_t low = 1;
+      int64_t high = max_tokens;
+      while (low < high) {
+        const int64_t mid = low + (high - low + 1) / 2;
+        if (mmf_eligible(mid)) {
+          low = mid;
+        } else {
+          high = mid - 1;
+        }
+      }
+      *chunk_size = low;
+      return MoeKernel::kMmfChunks;
     }
     STD_TORCH_CHECK(false, kMoeNotEligibleMarker,
                     ": neither MMVF nor MMF supports this type/shape/device");
   }
 
-  *mmvq_max = std::min<int>(MMVQ_MAX_BATCH_SIZE,
-                            get_mmvq_mmid_max_batch(ggml_type, cc));
-  if (*mmvq_max > 0 && tokens <= *mmvq_max) {
+  const int64_t mmvq_max = std::min<int>(
+      MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(ggml_type, cc));
+  const int64_t mmq_max = mmid_max_tokens(smpbo);
+  // Route count is the common workload measure for quantized MoE calls.
+  // The caller already checked tokens * top_k for int64 overflow.
+  if (tokens * top_k <= kMmvqMaxRoutes && mmvq_max > 0) {
+    *chunk_size = mmvq_max;
     return MoeKernel::kMmvq;
   }
-  // Preserve the MoE MMQ policy: template availability, shared memory and
-  // J tile size. The upstream top-level predicate is intentionally not used.
+  // Kernel availability and shared-memory limits still take precedence over
+  // the performance threshold.
   const bool fallback = row % 128 != 0;
-  if (upstream_mmq_type_supported(type) && smpbo >= 48 * 1024 &&
-      ggml_cuda_mmq_get_J_max(ggml_type, fallback, cc, tokens) > 0) {
-    return tokens <= mmid_max_tokens(smpbo) ? MoeKernel::kMmq
-                                            : MoeKernel::kMmqChunks;
+  if (upstream_mmq_type_supported(type) && smpbo >= 48 * 1024 && mmq_max > 0 &&
+      ggml_cuda_mmq_get_J_max(ggml_type, fallback, cc,
+                              std::min(tokens, mmq_max)) > 0) {
+    *chunk_size = mmq_max;
+    return MoeKernel::kMmq;
   }
-  if (type == GGML_TYPE_IQ1_M && *mmvq_max > 0) {
-    return MoeKernel::kIq1MChunks;
+  if (mmvq_max > 0) {
+    *chunk_size = mmvq_max;
+    return MoeKernel::kMmvq;
   }
   STD_TORCH_CHECK(false, kMoeNotEligibleMarker,
                   ": neither MMVQ nor MMQ supports this type/shape/device");
@@ -139,17 +315,35 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
   const int32_t device_index = X.get_device_index();
   const DeviceGuard device_guard(device_index);
   const auto& device = ggml_cuda_info().devices[device_index];
-  int mmvq_max = 0;
+  // Grouped dense sorts expert IDs on the host and cannot run during CUDA
+  // graph capture. Check the dense BLAS shape constraints before selecting it.
+  const bool grouped_eligible =
+      !is_upstream_float_type(type) && tokens > kGroupedTokenThreshold &&
+      tokens * top_k <= INT_MAX && row <= INT_MAX && k <= INT_MAX &&
+      (type != GGML_TYPE_MXFP4 || k % 256 == 0);
+  if (grouped_eligible) {
+    const cudaStream_t stream = current_stream(device_index);
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    STD_TORCH_CHECK(
+        cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess,
+        "upstream MoE could not query CUDA graph capture status");
+    if (capture_status == cudaStreamCaptureStatusNone) {
+      return run_upstream_moe_grouped(W, X, topk_ids, type, row, top_k, tokens,
+                                      k, stream);
+    }
+  }
+  int64_t chunk_size = 0;
   const MoeKernel kernel =
-      select_moe_kernel(W, type, row, tokens, device.cc, device.warp_size,
-                        device.smpbo, &mmvq_max);
+      select_moe_kernel(W, type, row, top_k, tokens, device.cc,
+                        device.warp_size, device.smpbo, &chunk_size);
 
   UpstreamCall call(X);
   const int64_t output_rows = tokens * top_k;
   const ProjectionBuffers buffers = projection_buffers(
       X, output_rows, row, 0, *call.scratch_pool, call.stream);
 
-  ggml_tensor src0 = kernel == MoeKernel::kMmvf || kernel == MoeKernel::kMmf
+  ggml_tensor src0 = kernel == MoeKernel::kMmvf || kernel == MoeKernel::kMmf ||
+                             kernel == MoeKernel::kMmfChunks
                          ? make_moe_float_weight_tensor(W, type)
                          : make_moe_weight_tensor(W, type, k, row);
   ggml_tensor src1 = make_moe_input_tensor(buffers.input, k, tokens);
@@ -157,10 +351,10 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
       static_cast<const int32_t*>(topk_ids.data_ptr()), top_k, tokens);
   ggml_tensor dst = make_moe_output_tensor(buffers.result, row, top_k, tokens);
 
-  if (kernel == MoeKernel::kMmvq) {
+  if (kernel == MoeKernel::kMmvq && tokens <= chunk_size) {
     ggml_cuda_mul_mat_vec_q(call.context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMVQ");
-  } else if (kernel == MoeKernel::kMmq) {
+  } else if (kernel == MoeKernel::kMmq && tokens <= chunk_size) {
     ggml_cuda_mul_mat_q(call.context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMQ");
   } else if (kernel == MoeKernel::kMmvf) {
@@ -170,11 +364,9 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
     ggml_cuda_mul_mat_f(call.context, &src0, &src1, &ids_tensor, &dst);
     check_launch("upstream MoE MMF");
   } else {
-    // MMQ's mmid helper needs 4 shared-memory bytes per token. IQ1_M has no
-    // MMQ instance, so its MMVQ calls retain the existing batch limit.
-    const bool chunked_mmq = kernel == MoeKernel::kMmqChunks;
-    const int64_t chunk_size =
-        chunked_mmq ? mmid_max_tokens(device.smpbo) : mmvq_max;
+    // Each chunk uses the selected kernel's token limit and writes directly
+    // into its slice of the shared projection output.
+    const bool chunked_mmq = kernel == MoeKernel::kMmq;
     for (int64_t start = 0; start < tokens;) {
       int64_t count = std::min<int64_t>(chunk_size, tokens - start);
       if (chunked_mmq && tokens - start - count > 0 &&
@@ -193,10 +385,14 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
         ggml_cuda_mul_mat_q(call.context, &src0, &chunk_input, &chunk_ids,
                             &chunk_output);
         check_launch("upstream MoE chunked MMQ");
+      } else if (kernel == MoeKernel::kMmfChunks) {
+        ggml_cuda_mul_mat_f(call.context, &src0, &chunk_input, &chunk_ids,
+                            &chunk_output);
+        check_launch("upstream MoE chunked MMF");
       } else {
         ggml_cuda_mul_mat_vec_q(call.context, &src0, &chunk_input, &chunk_ids,
                                 &chunk_output);
-        check_launch("upstream MoE IQ1_M MMVQ");
+        check_launch("upstream MoE chunked MMVQ");
       }
       start += count;
     }
