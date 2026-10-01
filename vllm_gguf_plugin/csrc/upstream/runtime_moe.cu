@@ -229,8 +229,10 @@ int64_t mmid_max_tokens(size_t smpbo) {
 }
 
 enum class MoeKernel {
+  kAuto,
   kMmvq,
   kMmq,
+  kGroupedDense,
   kMmvf,
   kMmf,
   kMmfChunks,
@@ -241,7 +243,11 @@ constexpr int64_t kGroupedTokenThreshold = 8192;
 
 MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
                             int64_t top_k, int64_t tokens, int cc,
-                            int warp_size, size_t smpbo, int64_t* chunk_size) {
+                            int warp_size, size_t smpbo, int64_t* chunk_size,
+                            MoeKernel requested) {
+  STD_TORCH_CHECK(
+      requested == MoeKernel::kAuto || !is_upstream_float_type(type),
+      "upstream MoE MMVQ/MMQ requires quantized weights");
   const auto ggml_type = static_cast<enum ggml_type>(type);
   if (is_upstream_float_type(type)) {
     const ggml_tensor weight = make_moe_float_weight_tensor(W, type);
@@ -287,10 +293,14 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
   const int64_t mmq_max = mmid_max_tokens(smpbo);
   // Route count is the common workload measure for quantized MoE calls.
   // The caller already checked tokens * top_k for int64 overflow.
-  if (tokens * top_k <= kMmvqMaxRoutes && mmvq_max > 0) {
+  if ((requested == MoeKernel::kMmvq ||
+       (requested == MoeKernel::kAuto && tokens * top_k <= kMmvqMaxRoutes)) &&
+      mmvq_max > 0) {
     *chunk_size = mmvq_max;
     return MoeKernel::kMmvq;
   }
+  STD_TORCH_CHECK(requested != MoeKernel::kMmvq,
+                  "upstream MoE MMVQ does not support this type/shape/device");
   // Kernel availability and shared-memory limits still take precedence over
   // the performance threshold.
   const bool fallback = row % 128 != 0;
@@ -300,6 +310,8 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
     *chunk_size = mmq_max;
     return MoeKernel::kMmq;
   }
+  STD_TORCH_CHECK(requested != MoeKernel::kMmq,
+                  "upstream MoE MMQ does not support this type/shape/device");
   if (mmvq_max > 0) {
     *chunk_size = mmvq_max;
     return MoeKernel::kMmvq;
@@ -311,22 +323,31 @@ MoeKernel select_moe_kernel(const Tensor& W, int64_t type, int64_t row,
 Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
                                    const Tensor& topk_ids, int64_t type,
                                    int64_t row, int64_t top_k, int64_t tokens,
-                                   int64_t k) {
+                                   int64_t k, MoeKernel requested) {
   const int32_t device_index = X.get_device_index();
   const DeviceGuard device_guard(device_index);
   const auto& device = ggml_cuda_info().devices[device_index];
   // Grouped dense sorts expert IDs on the host and cannot run during CUDA
   // graph capture. Check the dense BLAS shape constraints before selecting it.
-  const bool grouped_eligible =
-      !is_upstream_float_type(type) && tokens > kGroupedTokenThreshold &&
-      tokens * top_k <= INT_MAX && row <= INT_MAX && k <= INT_MAX &&
-      (type != GGML_TYPE_MXFP4 || k % 256 == 0);
-  if (grouped_eligible) {
+  const bool grouped_eligible = !is_upstream_float_type(type) &&
+                                tokens * top_k <= INT_MAX && row <= INT_MAX &&
+                                k <= INT_MAX &&
+                                (type != GGML_TYPE_MXFP4 || k % 256 == 0);
+  STD_TORCH_CHECK(
+      requested != MoeKernel::kGroupedDense || grouped_eligible,
+      "upstream MoE grouped dense does not support this type/shape");
+  if (requested == MoeKernel::kGroupedDense ||
+      (requested == MoeKernel::kAuto && tokens > kGroupedTokenThreshold &&
+       grouped_eligible)) {
     const cudaStream_t stream = current_stream(device_index);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     STD_TORCH_CHECK(
         cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess,
         "upstream MoE could not query CUDA graph capture status");
+    STD_TORCH_CHECK(
+        requested != MoeKernel::kGroupedDense ||
+            capture_status == cudaStreamCaptureStatusNone,
+        "upstream MoE grouped dense cannot run during CUDA graph capture");
     if (capture_status == cudaStreamCaptureStatusNone) {
       return run_upstream_moe_grouped(W, X, topk_ids, type, row, top_k, tokens,
                                       k, stream);
@@ -335,7 +356,7 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
   int64_t chunk_size = 0;
   const MoeKernel kernel =
       select_moe_kernel(W, type, row, top_k, tokens, device.cc,
-                        device.warp_size, device.smpbo, &chunk_size);
+                        device.warp_size, device.smpbo, &chunk_size, requested);
 
   UpstreamCall call(X);
   const int64_t output_rows = tokens * top_k;
@@ -400,10 +421,9 @@ Tensor run_upstream_moe_projection(const Tensor& W, const Tensor& X,
   return finish_output(buffers, call.stream);
 }
 
-}  // namespace
-
-Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
-                            int64_t row, int64_t top_k, int64_t tokens) {
+Tensor run_upstream_moe(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                        int64_t row, int64_t top_k, int64_t tokens,
+                        MoeKernel requested) {
   check_moe_inputs(X, W, topk_ids, type, row, top_k, tokens);
   const bool float_weight = is_upstream_float_type(type);
   const int64_t k =
@@ -420,10 +440,36 @@ Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
   checked_moe_product(routes, k, "routed input element count");
   checked_moe_product(routes, row, "routed output element count");
   return run_upstream_moe_projection(W, X, topk_ids, type, row, top_k, tokens,
-                                     k);
+                                     k, requested);
+}
+
+}  // namespace
+
+Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                            int64_t row, int64_t top_k, int64_t tokens) {
+  return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
+                          MoeKernel::kAuto);
 }
 
 Tensor ggml_moe_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                          int64_t row, int64_t top_k, int64_t tokens) {
   return ggml_moe_a8_upstream(X, W, topk_ids, type, row, top_k, tokens);
+}
+
+Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                     int64_t row, int64_t top_k, int64_t tokens) {
+  return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
+                          MoeKernel::kMmvq);
+}
+
+Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                    int64_t row, int64_t top_k, int64_t tokens) {
+  return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
+                          MoeKernel::kMmq);
+}
+
+Tensor ggml_moe_grouped_dense(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                              int64_t row, int64_t top_k, int64_t tokens) {
+  return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
+                          MoeKernel::kGroupedDense);
 }

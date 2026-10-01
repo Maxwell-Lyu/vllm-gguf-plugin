@@ -275,6 +275,10 @@ if (
         del topk_ids, quant_type, tokens
         return torch.empty((X.size(0) * top_k, row), dtype=X.dtype, device=W.device)
 
+    for _moe_op in ("ggml_moe_mmvq", "ggml_moe_mmq", "ggml_moe_grouped_dense"):
+        if hasattr(torch.ops._C_gguf, _moe_op):
+            register_fake(f"_C_gguf::{_moe_op}")(_ggml_moe_a8_upstream_fake)
+
     @register_fake("_C_gguf::ggml_moe_upstream")
     def _ggml_moe_upstream_fake(
         X: torch.Tensor,
@@ -461,6 +465,27 @@ def ggml_mul_mat_a8(
 
 def cuda_moe_upstream_kernel_available(quant_type: int) -> bool:
     return _cuda_moe_upstream_kernel_available("ggml_moe_upstream", quant_type)
+
+
+def ggml_moe_mmvq(X, W, topk_ids, quant_type, row, top_k, tokens):
+    """Force upstream MoE MMVQ, with internal token chunking and no fallback."""
+    return torch.ops._C_gguf.ggml_moe_mmvq(
+        X, W, topk_ids, quant_type, row, top_k, tokens
+    )
+
+
+def ggml_moe_mmq(X, W, topk_ids, quant_type, row, top_k, tokens):
+    """Force upstream MoE MMQ, with internal token chunking and no fallback."""
+    return torch.ops._C_gguf.ggml_moe_mmq(
+        X, W, topk_ids, quant_type, row, top_k, tokens
+    )
+
+
+def ggml_moe_grouped_dense(X, W, topk_ids, quant_type, row, top_k, tokens):
+    """Group routes by expert and use dense dispatch; CUDA graphs are unsupported."""
+    return torch.ops._C_gguf.ggml_moe_grouped_dense(
+        X, W, topk_ids, quant_type, row, top_k, tokens
+    )
 
 
 def ggml_moe_upstream(

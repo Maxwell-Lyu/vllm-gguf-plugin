@@ -86,6 +86,103 @@ def test_float_moe_weights_match_runtime_dtype_and_type(
 # Kernel correctness and storage
 
 
+@cuda_mark
+@torch.inference_mode()
+@pytest.mark.parametrize("kernel", ["mmvq", "mmq", "grouped_dense"])
+@pytest.mark.parametrize("tokens", [8, 129, 8193])
+def test_moe_explicit_kernel_reference_and_graph(kernel, tokens):
+    from vllm_gguf_plugin import ops
+
+    experts, row, k, top_k = 4, 128, 256, 2
+    source = (
+        np.random.default_rng(31).standard_normal((experts, row, k), dtype=np.float32)
+        * 0.1
+    )
+    packed = gguf.quantize(source.reshape(-1, k), Q.Q8_0).reshape(experts, row, -1)
+    weight = make_padded_weight(packed, Q.Q8_0, k)
+    dense = (
+        torch.from_numpy(gguf.dequantize(packed.reshape(-1, packed.shape[-1]), Q.Q8_0))
+        .cuda()
+        .view(experts, row, k)
+    )
+    x = torch.randn((tokens, k), device="cuda", dtype=torch.float32) * 0.1
+    ids = (
+        torch.arange(tokens, device="cuda", dtype=torch.int32)[:, None]
+        + torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+    ) % experts
+    op = getattr(ops, f"ggml_moe_{kernel}")
+    args = (x, weight, ids, int(Q.Q8_0), row, top_k, tokens)
+    sample = torch.tensor(sorted({0, 7, tokens // 2, tokens - 1}), device="cuda")
+
+    def check(output):
+        reference = torch.einsum("tk,tjrk->tjr", x[sample], dense[ids[sample].long()])
+        torch.testing.assert_close(
+            output.view(tokens, top_k, row)[sample], reference, atol=0.02, rtol=0.05
+        )
+
+    if tokens == 8193 and kernel != "grouped_dense":
+        # Verify the actual kernel above the automatic grouped-dense threshold.
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            output = op(*args)
+            torch.cuda.synchronize()
+        expected = "mul_mat_vec_q_moe" if kernel == "mmvq" else "mul_mat_q<"
+        assert any(expected in event.name for event in profile.events())
+        check(output)
+    else:
+        check(op(*args))
+    if tokens == 8:
+        check(ops.ggml_moe_upstream(*args))
+        # opcheck clones lose the padding tail behind packed weight views.
+        check(torch.compile(op, backend="eager", fullgraph=True)(*args))
+    graph = torch.cuda.CUDAGraph()
+    if kernel == "grouped_dense":
+        with (
+            pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"),
+            torch.cuda.graph(graph),
+        ):
+            op(*args)
+        return
+    with torch.cuda.graph(graph):
+        captured = op(*args)
+    ids.copy_((ids + 1) % experts)
+    graph.replay()
+    check(captured)
+
+
+@cuda_mark
+@pytest.mark.parametrize(
+    "kernel,quant_type,tokens,message",
+    [
+        ("mmvq", Q.F16, 8, "requires quantized weights"),
+        ("mmq", Q.F16, 8, "requires quantized weights"),
+        ("mmq", Q.IQ1_M, 8, "MMQ does not support"),
+        ("mmq", Q.Q8_0, 7, "MMQ does not support"),
+        ("grouped_dense", Q.F16, 8, "grouped dense does not support"),
+    ],
+)
+def test_moe_explicit_kernel_rejects_unsupported(kernel, quant_type, tokens, message):
+    from vllm_gguf_plugin import ops
+
+    experts, row, k = 2, 128, 256
+    if quant_type == Q.F16:
+        weight = torch.zeros((experts, row, k), device="cuda", dtype=torch.float16)
+    else:
+        block_size, type_size = gguf.GGML_QUANT_SIZES[quant_type]
+        packed = np.zeros((experts, row, k // block_size * type_size), dtype=np.uint8)
+        weight = make_padded_weight(packed, quant_type, k)
+    x = torch.zeros((tokens, k), device="cuda", dtype=torch.float32)
+    ids = torch.zeros((tokens, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=message):
+        getattr(ops, f"ggml_moe_{kernel}")(
+            x, weight, ids, int(quant_type), row, 1, tokens
+        )
+
+
 def test_moe_process_weights_after_loading_pads_3d_weights():
     # k=1184 is not a multiple of the 512-value MATRIX_ROW_PADDING, so a
     # storage tail must be reserved behind both 3D weights.
@@ -489,7 +586,8 @@ def test_moe_grouped_threshold_eager_and_graph_fallback(monkeypatch, tokens, top
 
 @cuda_mark
 @torch.inference_mode()
-def test_moe_mmq_chunks_at_mmid_shared_memory_limit(monkeypatch):
+@pytest.mark.parametrize("op_name", ["ggml_moe_upstream", "ggml_moe_mmq"])
+def test_moe_mmq_chunks_at_mmid_shared_memory_limit(monkeypatch, op_name):
     import vllm_gguf_plugin._C_gguf  # noqa: F401
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", "upstream")
@@ -515,7 +613,7 @@ def test_moe_mmq_chunks_at_mmid_shared_memory_limit(monkeypatch):
         0, experts, (tokens,), device="cuda", dtype=torch.int32
     )
     ids = torch.stack((first_expert, (first_expert + 1) % experts), dim=1)
-    op = torch.ops._C_gguf.ggml_moe_upstream
+    op = getattr(torch.ops._C_gguf, op_name)
 
     def check_sample(output):
         sample = torch.tensor(

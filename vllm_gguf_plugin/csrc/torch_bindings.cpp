@@ -35,6 +35,12 @@ Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                             int64_t row, int64_t top_k, int64_t tokens);
 Tensor ggml_moe_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                          int64_t row, int64_t top_k, int64_t tokens);
+Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                     int64_t row, int64_t top_k, int64_t tokens);
+Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                    int64_t row, int64_t top_k, int64_t tokens);
+Tensor ggml_moe_grouped_dense(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
+                              int64_t row, int64_t top_k, int64_t tokens);
 #endif
 int64_t ggml_moe_get_block_size(int64_t type);
 
@@ -82,6 +88,15 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
       "ggml_moe_upstream(Tensor X, Tensor W, Tensor topk_ids, "
       "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  ops.def(
+      "ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  ops.def(
+      "ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  ops.def(
+      "ggml_moe_grouped_dense(Tensor X, Tensor W, Tensor topk_ids, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
 #endif
   ops.def("ggml_moe_get_block_size(int type) -> int");
 }
@@ -105,6 +120,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
 #ifndef VLLM_GGUF_LEGACY_ONLY
   ops.impl("ggml_moe_a8_upstream", TORCH_BOX(&ggml_moe_a8_upstream));
   ops.impl("ggml_moe_upstream", TORCH_BOX(&ggml_moe_upstream));
+  ops.impl("ggml_moe_mmvq", TORCH_BOX(&ggml_moe_mmvq));
+  ops.impl("ggml_moe_mmq", TORCH_BOX(&ggml_moe_mmq));
+  ops.impl("ggml_moe_grouped_dense", TORCH_BOX(&ggml_moe_grouped_dense));
 #endif
 }
 
