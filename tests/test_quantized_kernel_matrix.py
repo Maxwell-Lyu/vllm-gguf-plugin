@@ -168,6 +168,45 @@ def test_pinned_q2_0_raw_upstream_entrypoints():
         )
         _check(moe, torch.zeros_like(moe), (batch * TOP_K, ROWS))
 
+    # The missing Python enum must not hide the aligned MMQ specialization.
+    blocks = moe_weight.view(-1, type_size)
+    blocks[:, 2:].random_(0, 256)
+    blocks[:, :2].copy_(
+        torch.tensor([0.01], device="cuda", dtype=torch.float16).view(torch.uint8)
+    )
+    dense = torch.ops._C_gguf.ggml_dequantize_upstream(
+        moe_weight.view(-1, packed_row), type_id, EXPERTS * ROWS, k, torch.float32
+    ).view(EXPERTS, ROWS, k)
+    tokens = 129
+    x = torch.randn((tokens, k), device="cuda") * 0.1
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    for top_k in (1, TOP_K):
+        ids = (
+            torch.arange(tokens, device="cuda", dtype=torch.int32)[:, None]
+            + torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+        ) % EXPERTS
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            aligned = moe_align_block_size(ids, 16, EXPERTS, pad_sorted_ids=True)
+            output = torch.ops._C_gguf.ggml_moe_mmq(
+                x,
+                moe_weight,
+                aligned[0],
+                type_id,
+                ROWS,
+                top_k,
+                tokens,
+                expert_ids=aligned[1],
+                padded_count=aligned[2],
+            )
+        ids.copy_((ids + 1) % EXPERTS)
+        graph.replay()
+        expected = torch.einsum("trnk,tk->trn", dense[ids.long()], x).reshape(
+            tokens * top_k, ROWS
+        )
+        _check(output, expected, (tokens * top_k, ROWS))
+
 
 @pytest.mark.parametrize("quant_type", UP_MMVQ, ids=lambda q: q.name)
 @pytest.mark.parametrize("batch", (1, 8))
@@ -308,6 +347,39 @@ def test_upstream_moe_all_types(quant_type, tokens):
     x, ids = _moe_inputs(tokens)
     actual = ops.ggml_moe_upstream(x, weight, ids, int(quant_type), ROWS, TOP_K, tokens)
     _check(actual, _moe_reference(x, ids, dense), (tokens * TOP_K, ROWS))
+
+
+@pytest.mark.parametrize("quant_type", UP_MMQ, ids=lambda q: q.name)
+@pytest.mark.parametrize("top_k", (1, TOP_K))
+@torch.inference_mode()
+def test_upstream_moe_explicit_mmq_all_types(quant_type, top_k):
+    # Force MMQ: small automatic MoE calls normally select MMVQ instead.
+    tokens = 129
+    weight, dense = _quant_weight(quant_type, moe=True)
+    x, ids = _moe_inputs(tokens)
+    ids = ids[:, :top_k].contiguous()
+
+    def run():
+        return ops.ggml_moe_mmq(x, weight, ids, int(quant_type), ROWS, top_k, tokens)
+
+    def check(actual):
+        expected = (
+            None
+            if dense is None
+            else torch.einsum(
+                "trnk,tk->trn", dense[ids.long()].float(), x.float()
+            ).reshape(tokens * top_k, ROWS)
+        )
+        _check(actual, expected, (tokens * top_k, ROWS))
+
+    check(run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    ids.copy_((ids + 1) % weight.shape[0])
+    x.mul_(0.5)
+    graph.replay()
+    check(output)
 
 
 @pytest.mark.parametrize("quant_type", LEG_MMVQ, ids=lambda q: q.name)

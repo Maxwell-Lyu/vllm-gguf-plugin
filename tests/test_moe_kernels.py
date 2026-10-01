@@ -88,6 +88,138 @@ def test_float_moe_weights_match_runtime_dtype_and_type(
 
 @cuda_mark
 @torch.inference_mode()
+@pytest.mark.parametrize("types", [(Q.Q4_0, Q.Q8_0), (Q.Q8_0, Q.Q8_0)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fused_moe_reuses_aligned_plan(monkeypatch, types, dtype):
+    from vllm.model_executor.layers.fused_moe import fused_moe as vllm_moe
+
+    from vllm_gguf_plugin.quantization.fused_moe import _fused_moe_gguf
+
+    experts, tokens, k, hidden, top_k = 4, 513, 256, 256, 2
+    rng = np.random.default_rng(43)
+    packed = []
+    for q, rows, cols in ((types[0], 2 * hidden, k), (types[1], k, hidden)):
+        source = rng.standard_normal((experts * rows, cols), dtype=np.float32) * 0.03
+        raw = gguf.quantize(source, q).reshape(experts, rows, -1)
+        packed.append(make_padded_moe_weight(raw, q, cols))
+    w1, w2 = packed
+    x = torch.randn((tokens, k), device="cuda", dtype=dtype) * 0.1
+    ids = (
+        torch.arange(tokens, device="cuda", dtype=torch.int32)[:, None]
+        + torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+    ) % experts
+    weights = torch.full((tokens, top_k), 1 / top_k, device="cuda", dtype=dtype)
+    monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", "upstream")
+    plans = []
+    original = vllm_moe.moe_align_block_size
+
+    def record(*args, **kwargs):
+        plan = original(*args, **kwargs)
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(vllm_moe, "moe_align_block_size", record)
+
+    def run():
+        return _fused_moe_gguf(
+            x, w1, w2, weights, ids, int(types[0]), int(types[1]), "silu"
+        )
+
+    def check(output):
+        z = torch.ops._C_gguf.ggml_moe_mmq(
+            x, w1, ids, int(types[0]), 2 * hidden, top_k, tokens
+        )
+        gate, up = z.chunk(2, -1)
+        h = (torch.nn.functional.silu(gate) * up).contiguous()
+        y = torch.ops._C_gguf.ggml_moe_mmq(
+            h, w2, ids.reshape(-1, 1), int(types[1]), k, 1, tokens * top_k
+        )
+        expected = (y.view(tokens, top_k, k) * weights[..., None]).sum(1)
+        torch.testing.assert_close(output, expected, atol=0.002, rtol=0.02)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        output = run()
+    assert len(plans) == 1
+    assert sum(e.name == "_C_gguf::ggml_moe_mmq" for e in profile.events()) == 2
+    check(output)
+    plans.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    assert len(plans) == 1
+    ids.copy_((ids + 2) % experts)
+    x.mul_(0.5)
+    graph.replay()
+    check(output)
+
+
+@cuda_mark
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_k", [1, 8])
+def test_moe_mmq_aligned_dynamic_routes(dtype, top_k):
+    # Odd expert/row counts, padded K, empty experts and changing graph routes.
+    _check_mmq_dynamic_routes(257, 137, top_k, dtype)
+
+
+@cuda_mark
+@torch.inference_mode()
+@pytest.mark.parametrize("experts", [1, 1024, 1025])
+def test_moe_mmq_aligned_expert_limits(experts):
+    # Above vLLM's alignment limit, keep the original upstream fallback.
+    _check_mmq_dynamic_routes(experts, 17, 1, torch.float32, k=512)
+
+
+def _check_mmq_dynamic_routes(experts, row, top_k, dtype, k=256):
+    from vllm_gguf_plugin import ops
+
+    tokens = 137
+    source = (
+        np.random.default_rng(97).standard_normal((experts, row, k), dtype=np.float32)
+        * 0.1
+    )
+    packed = gguf.quantize(source.reshape(-1, k), Q.Q8_0).reshape(experts, row, -1)
+    weight = make_padded_moe_weight(packed, Q.Q8_0, k)
+    dense = (
+        torch.from_numpy(gguf.dequantize(packed.reshape(-1, packed.shape[-1]), Q.Q8_0))
+        .cuda()
+        .view(experts, row, k)
+    )
+    x = torch.randn((tokens, k), device="cuda", dtype=dtype) * 0.1
+    ids = torch.empty((tokens, top_k), device="cuda", dtype=torch.int32)
+    offsets = torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+    ids.copy_((experts - top_k + offsets).expand_as(ids))
+
+    def run():
+        return ops.ggml_moe_mmq(x, weight, ids, int(Q.Q8_0), row, top_k, tokens)
+
+    def check(output):
+        reference = torch.einsum("tk,tjrk->tjr", x.float(), dense[ids.long()])
+        assert output.dtype == dtype
+        torch.testing.assert_close(
+            output.view(tokens, top_k, row).float(), reference, atol=0.015, rtol=0.05
+        )
+
+    check(run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    for spread in (True, False):
+        x.copy_(torch.randn_like(x) * 0.1)
+        base = (
+            torch.arange(tokens, device="cuda", dtype=torch.int32)[:, None] * 37
+            if spread
+            else 0
+        )
+        ids.copy_(((base + offsets) % experts).expand_as(ids))
+        graph.replay()
+        check(output)
+
+
+@cuda_mark
+@torch.inference_mode()
 @pytest.mark.parametrize("kernel", ["mmvq", "mmq", "grouped_dense"])
 @pytest.mark.parametrize("tokens", [8, 129, 8193])
 def test_moe_explicit_kernel_reference_and_graph(kernel, tokens):
@@ -180,6 +312,84 @@ def test_moe_explicit_kernel_rejects_unsupported(kernel, quant_type, tokens, mes
     with pytest.raises(RuntimeError, match=message):
         getattr(ops, f"ggml_moe_{kernel}")(
             x, weight, ids, int(quant_type), row, 1, tokens
+        )
+
+
+@cuda_mark
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
+def test_moe_mmq_alignment_preserves_input_contract(invalid):
+    from vllm_gguf_plugin import ops
+
+    tokens, k, row = 8, 256, 128
+    weight = make_padded_moe_weight(
+        np.zeros((2, row, k // 32 * 34), dtype=np.uint8), Q.Q8_0, k
+    )
+    x = torch.zeros((tokens, k), device="cuda")
+    ids = torch.zeros((tokens, 2), device="cuda", dtype=torch.int32)
+    if invalid == "shape":
+        ids = ids[:, :1].contiguous()
+    elif invalid == "dtype":
+        ids = ids.long()
+    else:
+        ids = torch.zeros((tokens, 4), device="cuda", dtype=torch.int32)[:, ::2]
+    with pytest.raises(RuntimeError, match="VLLM_GGUF_MOE_NOT_ELIGIBLE"):
+        ops.ggml_moe_mmq(x, weight, ids, int(Q.Q8_0), row, 2, tokens)
+
+
+@cuda_mark
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "expert_only",
+        "count_only",
+        "route_shape",
+        "route_dtype",
+        "route_stride",
+        "capacity",
+        "expert_dtype",
+        "count_dtype",
+        "count_size",
+    ],
+)
+def test_moe_mmq_shared_plan_contract(invalid):
+    from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    tokens, k, row = 8, 256, 128
+    weight = make_padded_moe_weight(
+        np.zeros((2, row, k // 32 * 34), dtype=np.uint8), Q.Q8_0, k
+    )
+    x = torch.zeros((tokens, k), device="cuda")
+    ids = torch.zeros((tokens, 2), device="cuda", dtype=torch.int32)
+    routes, experts, count = moe_align_block_size(ids, 16, 2, pad_sorted_ids=True)
+    if invalid == "expert_only":
+        count = None
+    elif invalid == "count_only":
+        experts = None
+    elif invalid == "route_shape":
+        routes = routes.view(-1, 1)
+    elif invalid == "route_dtype":
+        routes = routes.long()
+    elif invalid == "route_stride":
+        routes = torch.stack((routes, routes), dim=1)[:, 0]
+    elif invalid == "capacity":
+        routes = routes[:8]
+    elif invalid == "expert_dtype":
+        experts = experts.long()
+    elif invalid == "count_dtype":
+        count = count.long()
+    else:
+        count = count.expand(2).contiguous()
+    with pytest.raises(RuntimeError, match="VLLM_GGUF_MOE_NOT_ELIGIBLE"):
+        torch.ops._C_gguf.ggml_moe_mmq(
+            x,
+            weight,
+            routes,
+            int(Q.Q8_0),
+            row,
+            2,
+            tokens,
+            expert_ids=experts,
+            padded_count=count,
         )
 
 
@@ -613,7 +823,13 @@ def test_moe_mmq_chunks_at_mmid_shared_memory_limit(monkeypatch, op_name):
         0, experts, (tokens,), device="cuda", dtype=torch.int32
     )
     ids = torch.stack((first_expert, (first_expert + 1) % experts), dim=1)
-    op = getattr(torch.ops._C_gguf, op_name)
+    from vllm_gguf_plugin import ops
+
+    op = (
+        ops.ggml_moe_mmq
+        if op_name == "ggml_moe_mmq"
+        else getattr(torch.ops._C_gguf, op_name)
+    )
 
     def check_sample(output):
         sample = torch.tensor(
@@ -765,7 +981,8 @@ def test_iq_moe_w2_shape(quant_type):
 
 @cuda_mark
 @torch.inference_mode()
-def test_moe_graphs_and_concurrent_streams(monkeypatch):
+@pytest.mark.parametrize("op_name", ["ggml_moe_a8_upstream", "ggml_moe_mmq"])
+def test_moe_graphs_and_concurrent_streams(monkeypatch, op_name):
     """MoE projection under concurrent streams and CUDA graph capture.
 
     Covers the same stream contract as the dense kernel tests for the upstream MoE
@@ -800,7 +1017,13 @@ def test_moe_graphs_and_concurrent_streams(monkeypatch):
     inputs = [
         torch.randn(tokens, k, device="cuda", dtype=torch.float32) for _ in range(2)
     ]
-    op = torch.ops._C_gguf.ggml_moe_a8_upstream
+    from vllm_gguf_plugin import ops
+
+    op = (
+        ops.ggml_moe_mmq
+        if op_name == "ggml_moe_mmq"
+        else getattr(torch.ops._C_gguf, op_name)
+    )
     expected = [op(x, weight, ids, int(quant_type), n, top_k, tokens) for x in inputs]
 
     # Numerical reference for one stream's input: every token's every route.

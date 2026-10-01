@@ -119,12 +119,37 @@ def _fused_moe_gguf(
         _, N, _ = w1.shape
         top_k = topk_ids.shape[1]
         try:
-            out = ops.ggml_moe_upstream(
-                x, w1, topk_ids, weight_type, N, top_k, num_tokens
-            )
+            aligned = None
+            if (
+                num_tokens * top_k > 1024
+                and ops._cuda_moe_aligned_mmq_available(x, w1, weight_type)
+                and ops._cuda_moe_aligned_mmq_available(x, w2, weight_type2)
+            ):
+                aligned = moe_align_block_size(
+                    topk_ids, 16, w1.size(0), pad_sorted_ids=True
+                )
+
+            def project(inp, weight, ids, qtype, rows, top_k, tokens):
+                if aligned is None:
+                    return ops.ggml_moe_upstream(
+                        inp, weight, ids, qtype, rows, top_k, tokens
+                    )
+                return torch.ops._C_gguf.ggml_moe_mmq(
+                    inp,
+                    weight,
+                    aligned[0],
+                    qtype,
+                    rows,
+                    top_k,
+                    tokens,
+                    expert_ids=aligned[1],
+                    padded_count=aligned[2],
+                )
+
+            out = project(x, w1, topk_ids, weight_type, N, top_k, num_tokens)
             out = act(out)
             flat_topk_ids = topk_ids.reshape(-1, 1)
-            out = ops.ggml_moe_upstream(
+            out = project(
                 out,
                 w2,
                 flat_topk_ids,

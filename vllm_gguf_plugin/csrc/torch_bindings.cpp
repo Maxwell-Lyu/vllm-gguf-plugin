@@ -38,7 +38,9 @@ Tensor ggml_moe_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
 Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                      int64_t row, int64_t top_k, int64_t tokens);
 Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
-                    int64_t row, int64_t top_k, int64_t tokens);
+                    int64_t row, int64_t top_k, int64_t tokens,
+                    std::optional<Tensor> expert_ids,
+                    std::optional<Tensor> padded_count);
 Tensor ggml_moe_grouped_dense(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                               int64_t row, int64_t top_k, int64_t tokens);
 #endif
@@ -91,9 +93,12 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
       "ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, "
       "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  // Optional metadata makes topk_ids a flat sorted route list (tile size 16).
+  // Omitting both tensors preserves the original raw-ID contract.
   ops.def(
       "ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, "
-      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+      "int type, SymInt row, SymInt top_k, SymInt tokens, "
+      "Tensor? expert_ids=None, Tensor? padded_count=None) -> Tensor");
   ops.def(
       "ggml_moe_grouped_dense(Tensor X, Tensor W, Tensor topk_ids, "
       "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");

@@ -2,6 +2,7 @@
 #include "ggml_dypes.cuh"
 #include "torch_context.cuh"
 #include "mmq.cuh"
+#include "quantize.cuh"
 #include "mmvq.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <climits>
 #include <limits>
+#include <optional>
 #include <torch/csrc/stable/ops.h>
 
 int64_t ggml_dense_upstream_capabilities(Tensor W, Tensor X, int64_t type,
@@ -22,8 +24,8 @@ namespace {
 constexpr const char* kMoeNotEligibleMarker = "VLLM_GGUF_MOE_NOT_ELIGIBLE";
 
 void check_moe_inputs(const Tensor& X, const Tensor& W, const Tensor& topk_ids,
-                      int64_t type, int64_t row, int64_t top_k,
-                      int64_t tokens) {
+                      int64_t type, int64_t row, int64_t top_k, int64_t tokens,
+                      bool aligned = false) {
   STD_TORCH_CHECK(X.is_cuda() && W.is_cuda() && topk_ids.is_cuda(),
                   kMoeNotEligibleMarker,
                   ": all "
@@ -33,11 +35,12 @@ void check_moe_inputs(const Tensor& X, const Tensor& W, const Tensor& topk_ids,
                   kMoeNotEligibleMarker,
                   ": "
                   "tensors must be on the same CUDA device");
-  STD_TORCH_CHECK(X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2,
-                  kMoeNotEligibleMarker,
-                  ": "
-                  "expected X[ tokens, K ], W[ experts, rows, packed ], and "
-                  "topk_ids[ tokens, top_k ]");
+  STD_TORCH_CHECK(
+      X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == (aligned ? 1 : 2),
+      kMoeNotEligibleMarker,
+      ": "
+      "expected X[ tokens, K ], W[ experts, rows, packed ], and "
+      "route IDs with matching dimensions");
   STD_TORCH_CHECK(
       X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous(),
       kMoeNotEligibleMarker,
@@ -61,11 +64,13 @@ void check_moe_inputs(const Tensor& X, const Tensor& W, const Tensor& topk_ids,
   STD_TORCH_CHECK(tokens > 0 && top_k > 0 && row > 0, kMoeNotEligibleMarker,
                   ": "
                   "tokens, top_k, and row must be positive");
-  STD_TORCH_CHECK(X.size(0) == tokens && topk_ids.size(0) == tokens &&
-                      topk_ids.size(1) == top_k,
-                  kMoeNotEligibleMarker,
-                  ": "
-                  "shape arguments do not match X/topk_ids");
+  STD_TORCH_CHECK(
+      X.size(0) == tokens &&
+          (aligned ? topk_ids.numel() >= tokens * top_k
+                   : topk_ids.size(0) == tokens && topk_ids.size(1) == top_k),
+      kMoeNotEligibleMarker,
+      ": "
+      "shape arguments do not match X/topk_ids");
   STD_TORCH_CHECK(W.size(0) > 0 && W.size(1) == row && W.size(2) > 0,
                   kMoeNotEligibleMarker,
                   ": "
@@ -85,6 +90,67 @@ int64_t checked_moe_product(int64_t lhs, int64_t rhs, const char* name) {
       lhs > 0 && rhs > 0 && lhs <= std::numeric_limits<int64_t>::max() / rhs,
       kMoeNotEligibleMarker, ": ", name, " overflows int64");
   return lhs * rhs;
+}
+
+// Same aligned route plan is used for W1 and W2. Upstream gathers W1's
+// token r/top_k and W2's routed row r; padded entries gather a safe row.
+__global__ void aligned_source_rows(const int32_t* ids, const int32_t* count,
+                                    int32_t* src, int capacity, int routes,
+                                    int top_k) {
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p < capacity) {
+    const int r = p < *count ? ids[p] : routes;
+    src[p] = r >= 0 && r < routes ? r / top_k : 0;
+  }
+}
+
+template <ggml_type type>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, 16, true),
+                  ggml_cuda_mmq_get_occupancy(type, 16, true)) __global__
+    void aligned_mul_mat_q(const char* x, const int* y, const int32_t* ids,
+                           const int32_t* experts, const int32_t* count,
+                           float* dst, int k, int rows, int routes,
+                           int capacity, int stride_row, int stride_expert,
+                           int row_tiles) {
+  constexpr int J = 16;
+  constexpr int I = ggml_cuda_mmq_get_I(type, J, true);
+  const int tile = blockIdx.x / row_tiles;
+  const int row_tile = blockIdx.x % row_tiles;
+  const int start = tile * J;
+  if (start >= *count || experts[tile] < 0) return;
+  extern __shared__ int sid[];
+  __shared__ int last;
+  const int lane = threadIdx.y * 32 + threadIdx.x;
+  if (lane == 0) last = J - 1;
+  __syncthreads();
+  if (lane < J) {
+    const int r = ids[start + lane];
+    sid[lane] = r >= 0 && r < routes ? r : 0;
+    if (r < 0 || r >= routes) atomicMin(&last, lane - 1);
+  }
+  __syncthreads();
+  mul_mat_q_process_tile<type, J, true, false>(
+      x, experts[tile] * stride_expert + row_tile * I * stride_row,
+      y + static_cast<int64_t>(start) * (sizeof(block_q8_1_mmq) / sizeof(int)),
+      sid, dst + row_tile * I, nullptr, nullptr, stride_row, capacity, rows,
+      rows - row_tile * I - 1, last, 0, k / ggml_cuda_type_traits<type>::qk);
+}
+
+template <ggml_type type>
+void launch_aligned_mmq(const ggml_tensor& w, const int* q8, const Tensor& ids,
+                        const Tensor& experts, const Tensor& count, float* dst,
+                        int routes, const ggml_cuda_mmq_config& config, int cc,
+                        cudaStream_t stream) {
+  const int shared = mmq_get_nbytes_shared(config, cc);
+  const int row_tiles = (w.ne[1] + config.I - 1) / config.I;
+  CUDA_SET_SHARED_MEMORY_LIMIT(aligned_mul_mat_q<type>, shared);
+  aligned_mul_mat_q<type><<<ids.numel() / 16 * row_tiles,
+                            dim3(32, config.nthreads / 32), shared, stream>>>(
+      static_cast<const char*>(w.data), q8,
+      static_cast<const int32_t*>(ids.data_ptr()),
+      static_cast<const int32_t*>(experts.data_ptr()),
+      static_cast<const int32_t*>(count.data_ptr()), dst, w.ne[0], w.ne[1],
+      routes, ids.numel(), w.nb[1] / w.nb[0], w.nb[2] / w.nb[0], row_tiles);
 }
 
 template <typename T>
@@ -443,6 +509,78 @@ Tensor run_upstream_moe(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
                                      k, requested);
 }
 
+Tensor run_aligned_mmq(Tensor X, Tensor W, Tensor sorted_ids, Tensor expert_ids,
+                       Tensor padded_count, int64_t type, int64_t row,
+                       int64_t top_k, int64_t tokens) {
+  const int64_t routes = checked_moe_product(tokens, top_k, "route count");
+  check_moe_inputs(X, W, sorted_ids, type, row, top_k, tokens, true);
+  const int64_t k = logical_k_from_moe_weight(W, type, "aligned MoE MMQ");
+  const auto& device = ggml_cuda_info().devices[X.get_device_index()];
+  const auto config = ggml_cuda_mmq_get_config(static_cast<ggml_type>(type), 16,
+                                               true, device.cc);
+  STD_TORCH_CHECK(config.type != GGML_TYPE_COUNT &&
+                      mmq_get_nbytes_shared(config, device.cc) <= device.smpbo,
+                  kMoeNotEligibleMarker,
+                  ": aligned MMQ has no supported device configuration");
+  STD_TORCH_CHECK(
+      X.size(1) == k && has_weight_padding(W, k, type, "aligned MoE MMQ"),
+      kMoeNotEligibleMarker, ": weight/input K or padding mismatch");
+  for (const Tensor* t : {&expert_ids, &padded_count}) {
+    STD_TORCH_CHECK(
+        t->is_cuda() && t->get_device_index() == X.get_device_index() &&
+            t->is_contiguous() && t->scalar_type() == ScalarType::Int,
+        kMoeNotEligibleMarker, ": aligned metadata must be CUDA int32");
+  }
+  const int64_t capacity = sorted_ids.numel();
+  const int64_t kp = GGML_PAD(k, MATRIX_ROW_PADDING);
+  const int guard = GGML_PAD(16 * MMQ_TILE_Y_K, config.nthreads);
+  const int64_t ints_per_row =
+      (kp / QK8_1_MMQ) * (sizeof(block_q8_1_mmq) / sizeof(int));
+  const auto w = make_moe_weight_tensor(W, type, k, row);
+  STD_TORCH_CHECK(
+      capacity % 16 == 0 && expert_ids.numel() >= capacity / 16 &&
+          padded_count.numel() == 1 && routes <= INT_MAX / row &&
+          k <= INT_MAX - MATRIX_ROW_PADDING && row <= INT_MAX - config.I &&
+          capacity <= (INT_MAX - guard) / ints_per_row &&
+          w.nb[2] / w.nb[0] <= INT_MAX / W.size(0) &&
+          capacity / 16 <= INT_MAX / ((row + config.I - 1) / config.I),
+      kMoeNotEligibleMarker, ": unsupported aligned MMQ dimensions");
+  UpstreamCall call(X);
+  const auto buffers =
+      projection_buffers(X, routes, row, 0, *call.scratch_pool, call.stream);
+  const int64_t q8_ints = capacity * ints_per_row;
+  const int64_t offset = GGML_PAD(capacity, 64);
+  Tensor scratch =
+      torch::stable::new_empty(X, {offset + q8_ints + guard}, ScalarType::Int);
+  int32_t* src = static_cast<int32_t*>(scratch.data_ptr());
+  int* q8 = src + offset;
+  CUDA_CHECK(
+      cudaMemsetAsync(q8 + q8_ints, 0, guard * sizeof(int), call.stream));
+  aligned_source_rows<<<(capacity + 255) / 256, 256, 0, call.stream>>>(
+      static_cast<const int32_t*>(sorted_ids.data_ptr()),
+      static_cast<const int32_t*>(padded_count.data_ptr()), src, capacity,
+      routes, top_k);
+  quantize_mmq_q8_1_cuda(buffers.input, src, q8, static_cast<ggml_type>(type),
+                         k, k, 0, 0, kp, capacity, 1, 1, call.stream);
+  switch (type) {
+#define GGUF_ALIGNED_CASE(type)                                           \
+  case type:                                                              \
+    launch_aligned_mmq<type>(w, q8, sorted_ids, expert_ids, padded_count, \
+                             buffers.result, routes, config, device.cc,   \
+                             call.stream);                                \
+    break;
+#define GGUF_ALIGNED_TRAIT(type, block, cpp_type, name, quantized, mmq) \
+  GGUF_IF_MMQ(mmq, GGUF_ALIGNED_CASE, type)
+    GGUF_GGML_TYPE_TRAITS(GGUF_ALIGNED_TRAIT)
+#undef GGUF_ALIGNED_TRAIT
+#undef GGUF_ALIGNED_CASE
+    default:
+      GGML_ABORT("unsupported aligned MMQ type");
+  }
+  check_launch("upstream aligned MoE MMQ");
+  return finish_output(buffers, call.stream);
+}
+
 }  // namespace
 
 Tensor ggml_moe_a8_upstream(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
@@ -463,7 +601,17 @@ Tensor ggml_moe_mmvq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
 }
 
 Tensor ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int64_t type,
-                    int64_t row, int64_t top_k, int64_t tokens) {
+                    int64_t row, int64_t top_k, int64_t tokens,
+                    std::optional<Tensor> expert_ids,
+                    std::optional<Tensor> padded_count) {
+  STD_TORCH_CHECK(expert_ids.has_value() == padded_count.has_value(),
+                  kMoeNotEligibleMarker,
+                  ": expert_ids and padded_count must be supplied together");
+  if (expert_ids) {
+    // With a shared alignment plan, topk_ids contains the sorted flat routes.
+    return run_aligned_mmq(X, W, topk_ids, *expert_ids, *padded_count, type,
+                           row, top_k, tokens);
+  }
   return run_upstream_moe(X, W, topk_ids, type, row, top_k, tokens,
                           MoeKernel::kMmq);
 }

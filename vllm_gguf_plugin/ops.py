@@ -271,6 +271,8 @@ if (
         row: torch.SymInt,
         top_k: torch.SymInt,
         tokens: torch.SymInt,
+        expert_ids: torch.Tensor | None = None,
+        padded_count: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del topk_ids, quant_type, tokens
         return torch.empty((X.size(0) * top_k, row), dtype=X.dtype, device=W.device)
@@ -475,9 +477,42 @@ def ggml_moe_mmvq(X, W, topk_ids, quant_type, row, top_k, tokens):
 
 
 def ggml_moe_mmq(X, W, topk_ids, quant_type, row, top_k, tokens):
-    """Force upstream MoE MMQ, with internal token chunking and no fallback."""
+    """Force upstream MoE MMQ, reusing vLLM route alignment where supported."""
+    if (
+        tokens >= 8
+        and topk_ids.dim() == 2
+        and topk_ids.shape == (tokens, top_k)
+        and topk_ids.is_cuda
+        and topk_ids.device == X.device
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and _cuda_moe_aligned_mmq_available(X, W, quant_type)
+    ):
+        from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+        aligned = moe_align_block_size(topk_ids, 16, W.size(0), pad_sorted_ids=True)
+        return torch.ops._C_gguf.ggml_moe_mmq(
+            X,
+            W,
+            aligned[0],
+            quant_type,
+            row,
+            top_k,
+            tokens,
+            expert_ids=aligned[1],
+            padded_count=aligned[2],
+        )
     return torch.ops._C_gguf.ggml_moe_mmq(
         X, W, topk_ids, quant_type, row, top_k, tokens
+    )
+
+
+def _cuda_moe_aligned_mmq_available(X, W, quant_type):
+    return (
+        _cuda_upstream_supports("ggml_moe_mmq", quant_type, QuantizationOperation.MMQ)
+        and X.is_cuda
+        and W.dim() == 3
+        and 0 < W.size(0) <= 992  # vLLM rounds experts to 32 and requires <1024.
     )
 
 
