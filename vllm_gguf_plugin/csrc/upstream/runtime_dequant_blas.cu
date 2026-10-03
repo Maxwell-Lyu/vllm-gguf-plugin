@@ -38,9 +38,12 @@ void run_upstream_dequantize(const Tensor& W, Tensor& output, int64_t type,
           stream);
 }
 
-ScalarType blas_compute_dtype(int cc) {
-  ScalarType dtype =
-      fast_fp16_hardware_available(cc) ? ScalarType::Half : ScalarType::Float;
+ScalarType blas_compute_dtype(
+    int cc, std::optional<ScalarType> floating = std::nullopt) {
+  ScalarType dtype = floating.value_or(
+      fast_fp16_hardware_available(cc) ? ScalarType::Half : ScalarType::Float);
+  if (floating && dtype == ScalarType::BFloat16 && cc < GGML_CUDA_CC_AMPERE)
+    dtype = ScalarType::Float;
   const char* setting = std::getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
   if (setting != nullptr) {
     std::string name(setting);
@@ -65,26 +68,55 @@ ScalarType blas_compute_dtype(int cc) {
 
 }  // namespace
 
+bool upstream_blas_type_supported(int64_t type, int cc) {
+  try {
+    if (is_upstream_float_type(type)) {
+      const auto scalar = type == GGML_TYPE_F32   ? ScalarType::Float
+                          : type == GGML_TYPE_F16 ? ScalarType::Half
+                                                  : ScalarType::BFloat16;
+      blas_compute_dtype(cc, scalar);
+      return true;
+    }
+    if (!is_upstream_weight_type(type)) return false;
+    const auto dtype = blas_compute_dtype(cc);
+    const auto q = static_cast<ggml_type>(type);
+    if (dtype == ScalarType::Float) return ggml_get_to_fp32_cuda(q) != nullptr;
+    if (dtype == ScalarType::Half) return ggml_get_to_fp16_cuda(q) != nullptr;
+    return ggml_get_to_bf16_cuda(q) != nullptr;
+  } catch (const std::runtime_error&) {
+    // A BLAS-only configuration failure must not disable other methods.
+    return false;
+  }
+}
+
 Tensor run_upstream_blas(const Tensor& W, const Tensor& X, int64_t type,
                          int64_t row, int64_t k) {
   const int32_t device_index = X.get_device_index();
   const DeviceGuard device_guard(device_index);
   const cudaStream_t stream = current_stream(device_index);
   const int cc = ggml_cuda_info().devices[device_index].cc;
-  const ScalarType compute_dtype = blas_compute_dtype(cc);
+  const bool floating = is_upstream_float_type(type);
+  const ScalarType compute_dtype = blas_compute_dtype(
+      cc, floating ? std::optional<ScalarType>(W.scalar_type()) : std::nullopt);
   const int64_t batch = X.size(0);
   STD_TORCH_CHECK(type != GGML_TYPE_MXFP4 || k % 256 == 0,
                   "upstream MXFP4 cuBLAS requires K aligned to 256 values");
   STD_TORCH_CHECK(row <= INT_MAX && k <= INT_MAX && batch <= INT_MAX,
                   "upstream cuBLAS dimensions exceed int32 limits");
 
-  Tensor weights = torch::stable::new_empty(W, {row, k}, compute_dtype);
-  if (compute_dtype == ScalarType::Float) {
-    run_upstream_dequantize<float>(W, weights, type, row * k, stream);
-  } else if (compute_dtype == ScalarType::Half) {
-    run_upstream_dequantize<half>(W, weights, type, row * k, stream);
-  } else {
-    run_upstream_dequantize<nv_bfloat16>(W, weights, type, row * k, stream);
+  Tensor weights = W;
+  if (!floating || W.scalar_type() != compute_dtype) {
+    weights = torch::stable::new_empty(W, {row, k}, compute_dtype);
+    if (floating) {
+      cast_contiguous_async(weights.data_ptr(), compute_dtype, W.data_ptr(),
+                            W.scalar_type(), row * k, stream);
+    } else if (compute_dtype == ScalarType::Float) {
+      run_upstream_dequantize<float>(W, weights, type, row * k, stream);
+    } else if (compute_dtype == ScalarType::Half) {
+      run_upstream_dequantize<half>(W, weights, type, row * k, stream);
+    } else {
+      run_upstream_dequantize<nv_bfloat16>(W, weights, type, row * k, stream);
+    }
   }
 
   Tensor converted;

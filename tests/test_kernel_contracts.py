@@ -7,7 +7,6 @@ import gguf
 import numpy as np
 import pytest
 import torch
-from gguf import GGML_QUANT_SIZES
 from gguf import GGMLQuantizationType as Q
 
 from tests.helpers_upstream import make_padded_weight
@@ -75,7 +74,7 @@ def test_kernel_selector_rejects_invalid_values(monkeypatch):
 def test_support_matrix_is_explicit():
     from vllm_gguf_plugin import ops
 
-    extra_types = {int(q) for q in TEMPLATE_EXTRA_TYPES}
+    extra_types = {int(q) for q in TEMPLATE_EXTRA_TYPES} | {42}
     standard_mmvq = {
         ops.GGML_TYPE_Q4_0,
         ops.GGML_TYPE_Q4_1,
@@ -134,396 +133,144 @@ def test_all_upstream_template_instances_are_listed():
     assert actual <= listed
 
 
-@pytest.mark.parametrize(
-    "mode,expected",
-    [("auto", "upstream"), ("upstream", "upstream"), ("legacy", "legacy")],
-)
-def test_dense_mmvq_public_wrapper_selects_one_op(monkeypatch, mode, expected):
+@pytest.mark.parametrize("mode", ["auto", "upstream"])
+@pytest.mark.parametrize("wrapper", ["ggml_mul_mat_vec_a8", "ggml_mul_mat_a8"])
+def test_dense_compatibility_wrappers_delegate_to_decision(monkeypatch, mode, wrapper):
     from vllm_gguf_plugin import ops
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", mode)
-    monkeypatch.setattr(ops, "_cuda_upstream_supports", lambda *args: True)
-    monkeypatch.setattr(ops, "_cuda_kernel_available", lambda *args: True)
     calls = []
     monkeypatch.setattr(
-        ops, "ggml_dense_mmvq", lambda *args: calls.append("upstream") or "upstream"
+        ops, "ggml_dense", lambda *args: calls.append(args) or "central"
     )
     monkeypatch.setattr(
-        torch.ops._C_gguf,
-        "ggml_mul_mat_vec_a8",
-        lambda *args: calls.append("legacy") or "legacy",
+        ops, "_cuda_kernel_available", lambda *args: pytest.fail("backend fallback")
     )
-
-    result = ops.ggml_mul_mat_vec_a8(torch.empty(1), torch.empty(1), int(Q.Q4_0), 1)
-    assert result == expected
-    assert calls == [expected]
-
-
-@pytest.mark.parametrize(
-    "mode,caps,expected",
-    [
-        ("auto", "mmq", "mmq"),
-        ("upstream", "blas", "blas"),
-        ("legacy", "mmq", "legacy"),
-    ],
-)
-def test_dense_mmq_public_wrapper_selects_one_op(monkeypatch, mode, caps, expected):
-    from vllm_gguf_plugin import ops
-
-    monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", mode)
-    monkeypatch.setattr(ops, "_cuda_upstream_supports", lambda *args: True)
-    monkeypatch.setattr(ops, "_cuda_kernel_available", lambda *args: True)
-    monkeypatch.setattr(
-        ops,
-        "dense_upstream_capabilities",
-        lambda *args: ops.DENSE_MMQ if caps == "mmq" else ops.DENSE_BLAS,
-    )
-    calls = []
-    monkeypatch.setattr(
-        ops, "ggml_dense_mmq", lambda *args: calls.append("mmq") or "mmq"
-    )
-    monkeypatch.setattr(
-        ops, "ggml_dense_blas", lambda *args: calls.append("blas") or "blas"
-    )
-    monkeypatch.setattr(
-        torch.ops._C_gguf,
-        "ggml_mul_mat_a8",
-        lambda *args: calls.append("legacy") or "legacy",
-    )
-
-    result = ops.ggml_mul_mat_a8(torch.empty(1), torch.empty(1), int(Q.Q4_0), 1)
-    assert result == expected
-    assert calls == [expected]
+    args = (torch.empty(1), torch.empty(1), int(Q.Q4_0), 1)
+    assert getattr(ops, wrapper)(*args) == "central"
+    assert calls == [args]
 
 
 @pytest.mark.parametrize("wrapper", ["ggml_mul_mat_vec_a8", "ggml_mul_mat_a8"])
-@pytest.mark.parametrize(
-    "upstream_available,legacy_available,expected",
-    [(True, True, "upstream"), (False, True, "legacy"), (False, False, "triton")],
-)
-def test_dense_auto_fallback_order(
-    monkeypatch, wrapper, upstream_available, legacy_available, expected
-):
+def test_dense_auto_without_upstream_rejects_other_backends(monkeypatch, wrapper):
     from vllm_gguf_plugin import ops
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", "auto")
-    calls = []
+    monkeypatch.setattr(ops, "_CUDA_ENABLED", False)
     monkeypatch.setattr(
-        ops,
-        "_cuda_upstream_supports",
-        lambda *args: calls.append("check upstream") or upstream_available,
+        torch.ops._C_gguf, wrapper, lambda *args: pytest.fail("legacy executed")
     )
     monkeypatch.setattr(
-        ops,
-        "_cuda_kernel_available",
-        lambda *args: calls.append("check legacy") or legacy_available,
+        ops, "ggml_mul_mat_a8_triton", lambda *args: pytest.fail("triton executed")
     )
-
-    def supports(_quant_type, backend, _operation):
-        if backend == ops.QuantizationBackend.TRITON:
-            calls.append("check triton")
-        return True
-
-    monkeypatch.setattr(ops, "supports", supports)
-    monkeypatch.setattr(ops, "dense_upstream_capabilities", lambda *args: ops.DENSE_MMQ)
-    monkeypatch.setattr(
-        ops, "ggml_dense_mmvq", lambda *args: calls.append("upstream") or "upstream"
-    )
-    monkeypatch.setattr(
-        ops, "ggml_dense_mmq", lambda *args: calls.append("upstream") or "upstream"
-    )
-    monkeypatch.setattr(
-        torch.ops._C_gguf,
-        wrapper,
-        lambda *args: calls.append("legacy") or "legacy",
-    )
-    monkeypatch.setattr(
-        ops, "ggml_mul_mat_a8_triton", lambda *args: calls.append("triton") or "triton"
-    )
-
-    assert (
+    with pytest.raises(
+        RuntimeError, match="upstream CUDA op ggml_dense is unavailable"
+    ):
         getattr(ops, wrapper)(torch.empty(1), torch.empty(1), int(Q.Q4_0), 1)
-        == expected
-    )
-    assert calls[-1] == expected
-    assert "check upstream" in calls
-    assert ("check legacy" in calls) == (not upstream_available)
-    assert ("check triton" in calls) == (
-        not upstream_available and not legacy_available
-    )
 
 
-def test_dense_auto_does_not_fallback_when_upstream_inputs_have_no_route(monkeypatch):
+@pytest.mark.parametrize("mode", ["auto", "upstream"])
+def test_dequantize_auto_never_falls_back(monkeypatch, mode):
     from vllm_gguf_plugin import ops
 
-    monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", "auto")
-    monkeypatch.setattr(ops, "_cuda_upstream_supports", lambda *args: True)
-    monkeypatch.setattr(ops, "dense_upstream_capabilities", lambda *args: 0)
-    monkeypatch.setattr(
-        ops, "_cuda_kernel_available", lambda *args: pytest.fail("legacy checked")
-    )
-    with pytest.raises(RuntimeError, match="upstream MMQ/BLAS backend is unavailable"):
-        ops.ggml_mul_mat_a8(torch.empty(1), torch.empty(1), int(Q.Q4_0), 1)
-
-
-@pytest.mark.parametrize(
-    "wrapper,operation",
-    [
-        ("ggml_moe_a8", "MMQ"),
-        ("ggml_moe_a8_vec", "MMVQ"),
-    ],
-)
-@pytest.mark.parametrize(
-    "mode,legacy_available,expected",
-    [
-        ("auto", True, "legacy"),
-        ("auto", False, "triton"),
-        ("legacy", True, "legacy"),
-        ("triton", True, "triton"),
-    ],
-)
-def test_moe_public_wrapper_selects_one_op(
-    monkeypatch, wrapper, operation, mode, legacy_available, expected
-):
-    from vllm_gguf_plugin import ops
-
-    monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", mode)
-    calls = []
-
-    def legacy_available_for_op(op_name, quant_type, kind):
-        assert op_name == wrapper
-        assert kind == getattr(ops.QuantizationOperation, operation)
-        calls.append("check legacy")
-        return legacy_available
-
-    monkeypatch.setattr(ops, "_cuda_legacy_moe_available", legacy_available_for_op)
-    monkeypatch.setattr(
-        ops,
-        "supports",
-        lambda *args: calls.append("check triton") or True,
-    )
+    monkeypatch.setenv("VLLM_GGUF_CUDA_DEQUANTIZE_KERNEL", mode)
+    monkeypatch.setattr(ops, "_cuda_upstream_supports", lambda *args: False)
+    monkeypatch.setattr(ops, "_cuda_kernel_available", lambda *args: True)
     monkeypatch.setattr(
         torch.ops._C_gguf,
-        wrapper,
-        lambda *args: calls.append("legacy") or "legacy",
+        "ggml_dequantize",
+        lambda *args: pytest.fail("legacy executed"),
     )
     monkeypatch.setattr(
-        ops, "ggml_moe_a8_triton", lambda *args: calls.append("triton") or "triton"
+        ops, "ggml_dequantize_triton", lambda *args: pytest.fail("triton executed")
     )
-    if wrapper == "ggml_moe_a8":
-        result = ops.ggml_moe_a8(
-            torch.empty(1),
-            torch.empty((2, 1, 1)),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            int(Q.Q4_0),
-            1,
-            1,
-            1,
-        )
-    else:
-        from vllm.model_executor.layers.fused_moe import fused_moe
-
-        monkeypatch.setattr(
-            fused_moe,
-            "moe_align_block_size",
-            lambda *args: (torch.empty(1), torch.empty(1), torch.empty(1)),
-        )
-        monkeypatch.setattr(ops, "get_triton_moe_block_m", lambda *args: 16)
-        result = ops.ggml_moe_a8_vec(
-            torch.empty(1),
-            torch.empty((2, 1, 1)),
-            torch.empty(1),
-            1,
-            int(Q.Q4_0),
-            1,
-            1,
-        )
-    assert result == expected
-    assert calls[-1] == expected
-    assert ("check legacy" in calls) == (mode != "triton")
-    assert ("check triton" in calls) == (expected == "triton")
+    with pytest.raises(RuntimeError, match="upstream dequantize"):
+        ops.ggml_dequantize(torch.empty(1), int(Q.Q4_0), 1, 32, torch.float16)
 
 
-@pytest.mark.parametrize("wrapper", ["ggml_moe_a8", "ggml_moe_a8_vec"])
-@pytest.mark.parametrize("mode", ["upstream", "legacy", "triton", "auto"])
-def test_moe_public_wrapper_unavailable(monkeypatch, wrapper, mode):
+def test_moe_auto_without_upstream_rejects_other_backends(monkeypatch):
+    from vllm_gguf_plugin import ops
+
+    monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", "auto")
+    monkeypatch.setattr(ops, "_CUDA_ENABLED", False)
+    monkeypatch.setattr(
+        ops, "ggml_moe_a8", lambda *args: pytest.fail("legacy executed")
+    )
+    monkeypatch.setattr(
+        ops, "ggml_moe_a8_triton", lambda *args: pytest.fail("triton executed")
+    )
+    with pytest.raises(RuntimeError, match="upstream CUDA op ggml_moe is unavailable"):
+        ops.ggml_moe(
+            torch.empty(1), torch.empty(1), torch.empty(1), int(Q.Q4_0), 1, 1, 1
+        )
+
+
+@pytest.mark.parametrize("mode", ["auto", "upstream"])
+@pytest.mark.parametrize("quant_type", [Q.F32, Q.Q4_0])
+def test_linear_delegates_to_one_upstream_decision(monkeypatch, mode, quant_type):
+    from vllm_gguf_plugin import ops
+    from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
+
+    monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", mode)
+    calls = []
+    monkeypatch.setattr(
+        ops, "ggml_dense", lambda *args: calls.append(args) or "central"
+    )
+    monkeypatch.setattr(
+        ops, "dense_upstream_capabilities", lambda *args: pytest.fail("Python policy")
+    )
+    x = torch.empty((9, 256))
+    w = torch.empty((32, 256))
+    assert _fused_mul_mat_gguf(x, w, int(quant_type)) == "central"
+    assert calls == [(w, x, int(quant_type), 32)]
+
+
+@pytest.mark.parametrize("wrapper", ["ggml_mul_mat_vec_a8", "ggml_mul_mat_a8"])
+@pytest.mark.parametrize("mode", ["legacy", "triton"])
+def test_dense_explicit_backend_stays_available(monkeypatch, wrapper, mode):
+    from vllm_gguf_plugin import ops
+
+    monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", mode)
+    monkeypatch.setattr(ops, "_cuda_kernel_available", lambda *args: True)
+    monkeypatch.setattr(ops, "supports", lambda *args: True)
+    monkeypatch.setattr(torch.ops._C_gguf, wrapper, lambda *args: "legacy")
+    monkeypatch.setattr(ops, "ggml_mul_mat_a8_triton", lambda *args: "triton")
+    monkeypatch.setattr(
+        ops, "ggml_dense", lambda *args: pytest.fail("upstream executed")
+    )
+    assert getattr(ops, wrapper)(torch.empty(1), torch.empty(1), int(Q.Q4_0), 1) == mode
+
+
+@pytest.mark.parametrize("mode", ["legacy", "triton"])
+def test_moe_explicit_backend_stays_available(monkeypatch, mode):
     from vllm_gguf_plugin import ops
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", mode)
-    monkeypatch.setattr(ops, "_cuda_legacy_moe_available", lambda *args: False)
-    monkeypatch.setattr(ops, "supports", lambda *args: False)
-    args = (
-        (
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            int(Q.Q4_0),
-            1,
-            1,
-            1,
-        )
-        if wrapper == "ggml_moe_a8"
-        else (torch.empty(1), torch.empty(1), torch.empty(1), 1, int(Q.Q4_0), 1, 1)
-    )
-    with pytest.raises(RuntimeError, match=f"{mode} MoE MM"):
-        getattr(ops, wrapper)(*args)
+    monkeypatch.setattr(ops, "_cuda_legacy_moe_available", lambda *args: True)
+    monkeypatch.setattr(ops, "supports", lambda *args: True)
+    monkeypatch.setattr(torch.ops._C_gguf, "ggml_moe_a8", lambda *args: "legacy")
+    monkeypatch.setattr(ops, "ggml_moe_a8_triton", lambda *args: "triton")
+    assert ops.ggml_moe_a8(*(torch.empty(1),) * 5, int(Q.Q4_0), 1, 1, 1) == mode
 
 
-@pytest.mark.parametrize(
-    "mode,legacy_available,expected",
-    [
-        ("auto", True, 32),
-        ("auto", False, 16),
-        ("legacy", True, 32),
-        ("triton", True, 16),
-    ],
-)
-def test_moe_block_size_follows_selected_backend(
-    monkeypatch, mode, legacy_available, expected
-):
+@pytest.mark.parametrize("mode", ["auto", "upstream"])
+def test_legacy_moe_entry_cannot_implicitly_run_in_auto(monkeypatch, mode):
     from vllm_gguf_plugin import ops
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", mode)
     monkeypatch.setattr(
-        ops, "_cuda_legacy_moe_available", lambda *args: legacy_available
+        ops, "_cuda_legacy_moe_available", lambda *args: pytest.fail("legacy checked")
     )
-    monkeypatch.setattr(torch.ops._C_gguf, "ggml_moe_get_block_size", lambda *args: 32)
-    monkeypatch.setattr(ops, "get_triton_moe_block_m", lambda *args: 16)
-    assert ops.ggml_moe_get_block_size(int(Q.Q4_0)) == expected
+    with pytest.raises(RuntimeError, match=f"{mode} MoE MMQ"):
+        ops.ggml_moe_a8(*(torch.empty(1),) * 5, int(Q.Q4_0), 1, 1, 1)
 
 
-@pytest.mark.parametrize("limit", [1, 4, 5, 6, 7, 8])
-def test_linear_dispatch_uses_upstream_mmq_above_mmvq_limit(monkeypatch, limit):
-    from vllm_gguf_plugin import ops
-    from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
+def test_method_enum_matches_registered_cpp_values():
+    from vllm_gguf_plugin.kernel_support import KernelMethod
 
-    calls = []
-
-    def mmvq(weight, x, weight_type, row):
-        calls.append("mmvq")
-        return torch.empty((x.shape[0], row), dtype=x.dtype)
-
-    def mmq(weight, x, weight_type, row):
-        calls.append("mmq")
-        return torch.empty((x.shape[0], row), dtype=x.dtype)
-
-    monkeypatch.setattr(ops, "cuda_dense_upstream_enabled", lambda: True)
-    monkeypatch.setattr(
-        ops,
-        "dense_upstream_capabilities",
-        lambda weight, x, quant_type, row: (
-            ops.DENSE_MMVQ if x.shape[0] <= limit else ops.DENSE_MMQ
-        ),
-    )
-    monkeypatch.setattr(ops, "ggml_dense_mmvq", mmvq)
-    monkeypatch.setattr(ops, "ggml_dense_mmq", mmq)
-    quant_type = Q.IQ4_NL
-    block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    weight = torch.zeros((37, 256 // block_size * type_size), dtype=torch.uint8)
-
-    _fused_mul_mat_gguf(torch.zeros((limit, 256)), weight, int(quant_type))
-    _fused_mul_mat_gguf(torch.zeros((limit + 1, 256)), weight, int(quant_type))
-
-    assert calls == ["mmvq", "mmq"]
-
-
-def test_upstream_mmvq_policy_uses_tensor_device(monkeypatch):
-    from types import SimpleNamespace
-
-    from vllm_gguf_plugin import ops
-
-    # A tensor on cuda:3 must not be routed using the current device's cc.
-    x = SimpleNamespace(device=torch.device("cuda:3"), shape=(5, 256))
-
-    def capability(device):
-        assert device == x.device
-        return (8, 9)
-
-    def policy(quant_type, cc, batch):
-        assert (quant_type, cc, batch) == (int(Q.Q2_K), 890, 5)
-        return False
-
-    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
-    monkeypatch.setattr(
-        torch.ops._C_gguf, "ggml_should_use_mmvq", policy, raising=False
-    )
-    assert not ops.should_use_upstream_mmvq(x, int(Q.Q2_K))
-
-
-@pytest.mark.parametrize("quant_type,limit", [(Q.Q2_K, 6), (Q.IQ4_NL, 16)])
-def test_linear_non_upstream_dispatch_keeps_existing_limits(
-    monkeypatch, quant_type, limit
-):
-    from vllm_gguf_plugin import ops
-    from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
-
-    monkeypatch.setattr(ops, "cuda_dense_upstream_enabled", lambda: False)
-    monkeypatch.setattr(
-        ops, "should_use_upstream_mmvq", lambda *args: pytest.fail("upstream query")
-    )
-    calls = []
-    monkeypatch.setattr(ops, "ggml_mul_mat_vec_a8", lambda *args: calls.append("mmvq"))
-    monkeypatch.setattr(ops, "ggml_mul_mat_a8", lambda *args: calls.append("mmq"))
-    block_size, type_size = GGML_QUANT_SIZES[quant_type]
-    weight = torch.zeros((37, 256 // block_size * type_size), dtype=torch.uint8)
-    for batch in (limit, limit + 1):
-        _fused_mul_mat_gguf(torch.zeros((batch, 256)), weight, int(quant_type))
-    assert calls == ["mmvq", "mmq"]
-
-
-@pytest.mark.parametrize(
-    "caps,expected",
-    [
-        (1 | 2, "mmvf"),
-        (2, "mmf"),
-        (0, "torch"),
-    ],
-)
-def test_float_dense_route_is_selected_once(monkeypatch, caps, expected):
-    from vllm_gguf_plugin import ops
-    from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
-
-    calls = []
-    monkeypatch.setattr(ops, "cuda_dense_upstream_enabled", lambda: True)
-    monkeypatch.setattr(
-        ops,
-        "dense_upstream_capabilities",
-        lambda *args: calls.append("query") or caps,
-    )
-    monkeypatch.setattr(
-        ops, "ggml_dense_mmvf", lambda *args: calls.append("mmvf") or "mmvf"
-    )
-    monkeypatch.setattr(
-        ops, "ggml_dense_mmf", lambda *args: calls.append("mmf") or "mmf"
-    )
-    x = torch.ones((1, 128), dtype=torch.float32)
-    w = torch.ones((32, 128), dtype=torch.float32)
-    result = _fused_mul_mat_gguf(x, w, int(Q.F32))
-    assert ("torch" if isinstance(result, torch.Tensor) else result) == expected
-    assert calls == ["query"] + ([] if expected == "torch" else [expected])
-
-
-def test_quant_dense_blas_is_explicit(monkeypatch):
-    from vllm_gguf_plugin import ops
-    from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
-
-    monkeypatch.setattr(ops, "cuda_dense_upstream_enabled", lambda: True)
-    monkeypatch.setattr(
-        ops, "dense_upstream_capabilities", lambda *args: ops.DENSE_BLAS
-    )
-    monkeypatch.setattr(ops, "ggml_dense_blas", lambda *args: "blas")
-    monkeypatch.setattr(
-        ops, "ggml_mul_mat_vec_a8", lambda *args: pytest.fail("unexpected MMVQ")
-    )
-    monkeypatch.setattr(
-        ops, "ggml_mul_mat_a8", lambda *args: pytest.fail("unexpected MMQ")
-    )
-    w = torch.zeros((37, 128), dtype=torch.uint8)
-    assert _fused_mul_mat_gguf(torch.empty((2, 256)), w, int(Q.Q4_0)) == "blas"
+    for name, method in KernelMethod.__members__.items():
+        assert torch.ops._C_gguf.ggml_kernel_method_value(name) == int(method)
+    assert torch.ops._C_gguf.ggml_moe_alignment_block_size() == 16
 
 
 # GGML type catalog
@@ -555,7 +302,7 @@ def test_mmq_dispatch_matches_python_capabilities():
 
     # The pinned C++ kernels include Q2_0, which some gguf-python versions do
     # not expose. Compare every type visible to this Python installation.
-    known = {Q[name] for name in names if name in Q.__members__}
+    known = {Q[name] for name in names if name in Q.__members__} | {42}
     assert known == CUDA_UPSTREAM_MMQ_TYPES
     assert CUDA_UPSTREAM_MMVQ_TYPES - known == {Q.IQ1_M}
 
@@ -709,7 +456,7 @@ def test_dense_k_quant_dispatch_batches_1_to_16(
         elif caps & ops.DENSE_MMQ:
             selected_op = torch.ops._C_gguf.ggml_dense_mmq
         else:
-            selected_op = torch.ops._C_gguf.ggml_dense_blas
+            selected_op = torch.ops._C_gguf.ggml_dense_dequantize_blas
         expected = selected_op(weight, x, int(quant_type), n)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -726,3 +473,22 @@ def test_dense_k_quant_dispatch_batches_1_to_16(
         graph.replay()
         expected = fused_mul_mat_gguf(x, weight, int(quant_type))
         torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+
+
+def test_fixed_method_python_argument_names_are_consistent():
+    import inspect
+
+    from vllm_gguf_plugin import ops
+
+    dense_args = ("W", "X", "quant_type", "row")
+    moe_args = ("X", "W", "topk_ids", "quant_type", "row", "top_k", "tokens")
+    for method in ("mmvq", "mmq", "mmvf", "mmf", "blas", "dequantize_blas"):
+        assert (
+            tuple(inspect.signature(getattr(ops, f"ggml_dense_{method}")).parameters)
+            == dense_args
+        )
+        assert (
+            tuple(inspect.signature(getattr(ops, f"ggml_moe_{method}")).parameters)
+            == moe_args
+        )
+    assert tuple(inspect.signature(ops.ggml_moe_grouped_dense).parameters) == moe_args

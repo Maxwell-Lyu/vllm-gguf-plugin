@@ -139,8 +139,9 @@ if _should_build_extension():
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
     is_rocm = getattr(torch.version, "hip", None) is not None
+    legacy_only = is_rocm or os.environ.get("VLLM_GGUF_BUILD_LEGACY_ONLY", "0") == "1"
 
-    if not is_rocm:
+    if not legacy_only:
         _check_upstream_checkout()
 
     nvcc_args = [
@@ -165,7 +166,7 @@ if _should_build_extension():
                 "-Xcompiler=-ffunction-sections",
             ]
         )
-    else:
+    if legacy_only:
         # Upstream CUDA entry points live in runtime_dense.cu and runtime_moe.cu.
         # Keep ROCm on the unchanged legacy implementation.
         nvcc_args.append("-DVLLM_GGUF_LEGACY_ONLY")
@@ -176,7 +177,7 @@ if _should_build_extension():
         "-fvisibility=hidden",
         "-ffunction-sections",
     ]
-    if is_rocm:
+    if legacy_only:
         cxx_args.append("-DVLLM_GGUF_LEGACY_ONLY")
 
     sources = [
@@ -184,7 +185,7 @@ if _should_build_extension():
         "vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu",
     ]
     extra_link_args: list[str] = []
-    if not is_rocm:
+    if not legacy_only:
         sources.extend(
             [
                 "vllm_gguf_plugin/csrc/upstream/runtime_dense.cu",

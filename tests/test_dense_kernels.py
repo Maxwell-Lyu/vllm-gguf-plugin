@@ -260,7 +260,7 @@ def test_dense_iq1_m_blas_nondefault_stream_and_graph(monkeypatch):
     weight = make_padded_weight(raw, Q.IQ1_M, k)
     dense = torch.from_numpy(gguf.dequantize(raw, Q.IQ1_M)).cuda()
     x = torch.randn((batch, k), device="cuda", dtype=torch.float16)
-    op = torch.ops._C_gguf.ggml_dense_blas
+    op = torch.ops._C_gguf.ggml_dense_dequantize_blas
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -316,7 +316,7 @@ def test_float_dense_upstream_dispatch(
     elif caps & ops.DENSE_MMF:
         expected = torch.ops._C_gguf.ggml_dense_mmf(w, x, int(quant_type), rows)
     else:
-        expected = x @ w.T
+        expected = ops.ggml_dense_blas(w, x, int(quant_type), rows)
     actual = _fused_mul_mat_gguf(x, w, int(quant_type))
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     # Ampere's F32 MMF uses TF32 tensor-core instructions.
@@ -328,7 +328,7 @@ def test_float_dense_upstream_dispatch(
 
 @cuda_mark
 @torch.inference_mode()
-def test_float_dense_misaligned_weight_uses_torch(monkeypatch):
+def test_float_dense_misaligned_weight_uses_blas(monkeypatch):
     from vllm_gguf_plugin import ops
     from vllm_gguf_plugin.quantization.linear import _fused_mul_mat_gguf
 
@@ -336,7 +336,7 @@ def test_float_dense_misaligned_weight_uses_torch(monkeypatch):
     storage = torch.randn(64 * 256 + 1, device="cuda", dtype=torch.float16)
     weight = storage[1:].view(64, 256)
     x = torch.randn((1, 256), device="cuda", dtype=torch.float16)
-    assert ops.dense_upstream_capabilities(weight, x, int(Q.F16), 64) == 0
+    assert ops.dense_supported_methods(weight, x, int(Q.F16), 64) == ops.DENSE_BLAS
     torch.testing.assert_close(_fused_mul_mat_gguf(x, weight, int(Q.F16)), x @ weight.T)
 
 

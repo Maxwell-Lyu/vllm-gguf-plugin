@@ -35,8 +35,8 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA unavailable"
 )
 
-UP_MMVQ = sorted(CUDA_UPSTREAM_MMVQ_TYPES, key=int)
-UP_MMQ = sorted(CUDA_UPSTREAM_MMQ_TYPES, key=int)
+UP_MMVQ = sorted((q for q in CUDA_UPSTREAM_MMVQ_TYPES if isinstance(q, Q)), key=int)
+UP_MMQ = sorted((q for q in CUDA_UPSTREAM_MMQ_TYPES if isinstance(q, Q)), key=int)
 LEG_MMVQ = sorted(CUDA_LEGACY_MMVQ_TYPES, key=int)
 LEG_MMQ = sorted(CUDA_LEGACY_MMQ_TYPES, key=int)
 ROWS, K, EXPERTS, TOP_K = 128, 256, 3, 2
@@ -122,7 +122,9 @@ def _check(
     [
         *(
             ("upstream", quant_type)
-            for quant_type in sorted(CUDA_UPSTREAM_DEQUANT_TYPES, key=int)
+            for quant_type in sorted(
+                (q for q in CUDA_UPSTREAM_DEQUANT_TYPES if isinstance(q, Q)), key=int
+            )
         ),
         *(("legacy", quant_type) for quant_type in LEG_MMVQ),
     ],
@@ -152,10 +154,10 @@ def test_pinned_q2_0_raw_upstream_entrypoints():
     for batch, flag, name in (
         (1, ops.DENSE_MMVQ, "ggml_dense_mmvq"),
         (9, ops.DENSE_MMQ, "ggml_dense_mmq"),
-        (65, ops.DENSE_BLAS, "ggml_dense_blas"),
+        (65, ops.DENSE_DEQUANTIZE_BLAS, "ggml_dense_dequantize_blas"),
     ):
         x = torch.zeros((batch, k), device="cuda")
-        assert ops.dense_upstream_capabilities(weight, x, type_id, ROWS) & flag
+        assert ops.dense_supported_methods(weight, x, type_id, ROWS) & flag
         actual = getattr(torch.ops._C_gguf, name)(weight, x, type_id, ROWS)
         _check(actual, torch.zeros_like(actual), (batch, ROWS))
         ids = torch.tensor(
@@ -189,7 +191,7 @@ def test_pinned_q2_0_raw_upstream_entrypoints():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             aligned = moe_align_block_size(ids, 16, EXPERTS, pad_sorted_ids=True)
-            output = torch.ops._C_gguf.ggml_moe_mmq(
+            output = torch.ops._C_gguf.ggml_moe_mmq_aligned(
                 x,
                 moe_weight,
                 aligned[0],
@@ -214,7 +216,7 @@ def test_pinned_q2_0_raw_upstream_entrypoints():
 def test_upstream_dense_mmvq_all_types(quant_type, batch):
     weight, dense = _quant_weight(quant_type, moe=False)
     x = _input(batch)
-    caps = ops.dense_upstream_capabilities(weight, x, int(quant_type), ROWS)
+    caps = ops.dense_supported_methods(weight, x, int(quant_type), ROWS)
     if not caps & ops.DENSE_MMVQ:
         pytest.skip(f"MMVQ not eligible on this GPU: {quant_type.name}, batch={batch}")
     actual = ops.ggml_dense_mmvq(weight, x, int(quant_type), ROWS)
@@ -227,7 +229,7 @@ def test_upstream_dense_mmvq_all_types(quant_type, batch):
 def test_upstream_dense_mmq_all_types(quant_type, batch):
     weight, dense = _quant_weight(quant_type, moe=False)
     x = _input(batch)
-    caps = ops.dense_upstream_capabilities(weight, x, int(quant_type), ROWS)
+    caps = ops.dense_supported_methods(weight, x, int(quant_type), ROWS)
     if not caps & ops.DENSE_MMQ:
         pytest.skip(f"MMQ not eligible on this GPU: {quant_type.name}, batch={batch}")
     actual = ops.ggml_dense_mmq(weight, x, int(quant_type), ROWS)
@@ -239,9 +241,9 @@ def test_upstream_dense_mmq_all_types(quant_type, batch):
 def test_upstream_dense_blas_all_types(quant_type):
     weight, dense = _quant_weight(quant_type, moe=False)
     x = _input(65)
-    caps = ops.dense_upstream_capabilities(weight, x, int(quant_type), ROWS)
-    assert caps & ops.DENSE_BLAS, (quant_type.name, caps)
-    actual = ops.ggml_dense_blas(weight, x, int(quant_type), ROWS)
+    caps = ops.dense_supported_methods(weight, x, int(quant_type), ROWS)
+    assert caps & ops.DENSE_DEQUANTIZE_BLAS, (quant_type.name, caps)
+    actual = ops.ggml_dense_dequantize_blas(weight, x, int(quant_type), ROWS)
     _check(actual, x @ dense.T if dense is not None else None, (65, ROWS))
 
 
@@ -252,14 +254,14 @@ def test_upstream_dense_python_route_all_types(monkeypatch, quant_type, batch):
     monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", "upstream")
     weight, dense = _quant_weight(quant_type, moe=False)
     x = _input(batch)
-    caps = ops.dense_upstream_capabilities(weight, x, int(quant_type), ROWS)
+    caps = ops.dense_select_method(weight, x, int(quant_type), ROWS)
     selected = next(
         (
             op
             for flag, op in (
                 (ops.DENSE_MMVQ, ops.ggml_dense_mmvq),
                 (ops.DENSE_MMQ, ops.ggml_dense_mmq),
-                (ops.DENSE_BLAS, ops.ggml_dense_blas),
+                (ops.DENSE_DEQUANTIZE_BLAS, ops.ggml_dense_dequantize_blas),
             )
             if caps & flag
         ),
@@ -444,15 +446,15 @@ def test_fused_moe_python_route_all_types(
     weights = torch.full((tokens, TOP_K), 1 / TOP_K, device="cuda")
     calls = []
     for name, label in (
-        ("ggml_moe_upstream", "upstream"),
+        ("ggml_moe", "upstream"),
         ("ggml_moe_a8_vec", "vec"),
         ("ggml_moe_a8", "mmq"),
     ):
         original = getattr(ops, name)
 
-        def recording(*args, _original=original, _label=label):
+        def recording(*args, _original=original, _label=label, **kwargs):
             calls.append(_label)
-            return _original(*args)
+            return _original(*args, **kwargs)
 
         monkeypatch.setattr(ops, name, recording)
     actual = _fused_moe_gguf(

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "ggml_dypes.cuh"
+#include "kernel_dispatch.cuh"
 #include "torch_context.cuh"
-#include "mmq.cuh"
-#include "mmvq.cuh"
-#include "mmvf.cuh"
-#include "mmf.cuh"
 #include "quantize.cuh"
 
 #include <climits>
@@ -17,11 +13,13 @@ Tensor run_upstream_blas(const Tensor& W, const Tensor& X, int64_t type,
                          int64_t row, int64_t k);
 
 namespace {
-constexpr int64_t kDenseMmvf = 1;
-constexpr int64_t kDenseMmf = 2;
-constexpr int64_t kDenseMmvq = 4;
-constexpr int64_t kDenseMmq = 8;
-constexpr int64_t kDenseBlas = 16;
+constexpr int64_t kDenseMmvf = method_bit(KernelMethod::Mmvf);
+constexpr int64_t kDenseMmf = method_bit(KernelMethod::Mmf);
+constexpr int64_t kDenseMmvq = method_bit(KernelMethod::Mmvq);
+constexpr int64_t kDenseMmq = method_bit(KernelMethod::Mmq);
+constexpr int64_t kDenseDequantizeBlas =
+    method_bit(KernelMethod::DequantizeBlas);
+constexpr int64_t kDenseBlas = method_bit(KernelMethod::Blas);
 
 void check_dense_inputs(const Tensor& W, const Tensor& X, int64_t row,
                         const char* op_name) {
@@ -59,23 +57,6 @@ void ggml_upstream_mul_mat_q(ggml_backend_cuda_context& context,
     default:
       GGML_ABORT("unsupported upstream MMQ type");
   }
-}
-
-bool mmq_has_launch_config(ggml_type type, int cc, int64_t batch, int64_t row,
-                           size_t smpbo) {
-  if (ggml_cuda_mmq_get_J_max(type, row % 128 != 0, cc, batch) <= 0) {
-    return false;
-  }
-  for (int j = gguf_constants::kMmqTileStep;
-       j <= gguf_constants::kMmqTileColumnsMax;
-       j += gguf_constants::kMmqTileStep) {
-    const auto config = ggml_cuda_mmq_get_config(type, j, row % 128 != 0, cc);
-    if (config.type != GGML_TYPE_COUNT &&
-        mmq_get_nbytes_shared(config, cc) <= smpbo) {
-      return true;
-    }
-  }
-  return false;
 }
 
 Tensor run_upstream_float(const Tensor& W, const Tensor& X, int64_t type,
@@ -131,12 +112,13 @@ Tensor run_upstream_mmq(const Tensor& W, const Tensor& X, int64_t type,
   const int64_t k_padded = padded_k(k);
   const int cc = ggml_cuda_info().devices[device_index].cc;
   const bool fallback = row % 128 != 0;
-  const int j_max = ggml_cuda_mmq_get_J_max(static_cast<ggml_type>(type),
-                                            fallback, cc, batch);
+  const int j_max = ggml_cuda_mmq_get_J_max(
+      static_cast<ggml_type>(type), fallback, cc,
+      std::max<int64_t>(batch, gguf_constants::kMmqTileStep));
   STD_TORCH_CHECK(j_max > 0, "ggml_dense_mmq: no upstream MMQ configuration");
   STD_TORCH_CHECK(
-      mmq_has_launch_config(static_cast<ggml_type>(type), cc, batch, row,
-                            ggml_cuda_info().devices[device_index].smpbo),
+      gguf_dispatch::mmq_launch_supported(
+          type, row, cc, ggml_cuda_info().devices[device_index].smpbo),
       "ggml_dense_mmq: no launchable upstream MMQ tile");
   UpstreamCall call(X);
   const cudaStream_t stream = call.stream;
@@ -215,100 +197,114 @@ Tensor run_upstream_mmq(const Tensor& W, const Tensor& X, int64_t type,
   return finish_output(buffers, stream);
 }
 
-int64_t upstream_dense_capabilities(const Tensor& W, const Tensor& X,
-                                    int64_t type, int64_t row) {
+int64_t dense_supported_methods(const Tensor& W, const Tensor& X, int64_t type,
+                                int64_t row) {
   if (!W.is_cuda() || !X.is_cuda() ||
       W.get_device_index() != X.get_device_index() || W.dim() != 2 ||
       X.dim() != 2 || !W.is_contiguous() || !X.is_contiguous() || row <= 0 ||
-      row > W.size(0) || X.size(0) <= 0 || X.size(0) > INT_MAX ||
+      row > W.size(0) || row > INT_MAX || X.size(1) > INT_MAX ||
+      X.size(0) < 0 || X.size(0) > INT_MAX ||
       (X.scalar_type() != ScalarType::Float &&
        X.scalar_type() != ScalarType::Half &&
-       X.scalar_type() != ScalarType::BFloat16)) {
+       X.scalar_type() != ScalarType::BFloat16))
     return 0;
-  }
-  const DeviceGuard device_guard(X.get_device_index());
+  const DeviceGuard guard(X.get_device_index());
   const auto& device = ggml_cuda_info().devices[X.get_device_index()];
-  const auto quant_type = static_cast<ggml_type>(type);
   const int64_t batch = X.size(0);
   if (is_upstream_float_type(type)) {
     if (!float_type_matches(W, type) || row != W.size(0) ||
-        W.size(1) != X.size(1) ||
-        reinterpret_cast<uintptr_t>(W.data_ptr()) % (2 * W.element_size()) !=
-            0) {
+        W.size(1) != X.size(1) || X.size(1) <= 0)
       return 0;
-    }
-    const ggml_tensor weight = make_float_weight_tensor(W, type);
-    int64_t caps = 0;
-    if (ggml_cuda_should_use_mmvf(quant_type, device.cc, weight.ne, weight.nb,
-                                  batch)) {
+    int64_t caps = row <= INT_MAX && X.size(1) <= INT_MAX &&
+                           upstream_blas_type_supported(type, device.cc)
+                       ? kDenseBlas
+                       : 0;
+    if (gguf_dispatch::float_layout_supported(W, type) &&
+        batch <= MMVF_MAX_BATCH_SIZE)
       caps |= kDenseMmvf;
-    }
-    if (ggml_cuda_should_use_mmf(quant_type, device.cc, device.warp_size,
-                                 weight.ne, weight.nb, batch, false)) {
+    if (gguf_dispatch::mmf_shape_supported(W, type, device.cc, device.warp_size,
+                                           false, batch))
       caps |= kDenseMmf;
-    }
     return caps;
   }
-  if (!is_upstream_weight_type(type) || W.element_size() != 1) {
-    return 0;
-  }
-  const int64_t k = logical_k_from_weight(W, type, "dense capabilities");
-  if (X.size(1) != k) {
-    return 0;
-  }
-  int64_t caps = row <= INT_MAX && k <= INT_MAX &&
+  if (!is_upstream_weight_type(type) || W.element_size() != 1) return 0;
+  const size_t ts = type_size_for_type(type, "dense support");
+  if (W.size(1) <= 0 || W.size(1) % ts != 0) return 0;
+  const int64_t k = logical_k_from_weight(W, type, "dense support");
+  if (X.size(1) != k || k > INT_MAX || row > INT_MAX) return 0;
+  int64_t caps = upstream_blas_type_supported(type, device.cc) &&
                          (type != GGML_TYPE_MXFP4 || k % 256 == 0)
-                     ? kDenseBlas
+                     ? kDenseDequantizeBlas
                      : 0;
-  const bool padded = has_weight_padding(W, k, type, "dense capabilities");
-  if (padded && batch <= MMVQ_MAX_BATCH_SIZE &&
-      ggml_cuda_should_use_mmvq(quant_type, device.cc, batch)) {
-    caps |= kDenseMmvq;
-  }
-  if (padded && upstream_mmq_type_supported(type) &&
-      ggml_cuda_should_use_mmq(quant_type, device.cc, batch, 0) &&
-      mmq_has_launch_config(quant_type, device.cc, batch, row, device.smpbo)) {
-    caps |= kDenseMmq;
+  if (k <= INT_MAX - MATRIX_ROW_PADDING &&
+      has_weight_padding(W, k, type, "dense support")) {
+    if (batch <= MMVQ_MAX_BATCH_SIZE) caps |= kDenseMmvq;
+    if (gguf_dispatch::mmq_launch_supported(type, row, device.cc, device.smpbo))
+      caps |= kDenseMmq;
   }
   return caps;
 }
 
+int64_t dense_recommended_methods(const Tensor& W, const Tensor& X,
+                                  int64_t type, int64_t row) {
+  int64_t caps = dense_supported_methods(W, X, type, row);
+  if (!caps || X.size(0) == 0) return caps;
+  const DeviceGuard guard(X.get_device_index());
+  const auto& d = ggml_cuda_info().devices[X.get_device_index()];
+  const auto q = static_cast<ggml_type>(type);
+  if (is_upstream_float_type(type)) {
+    const auto w = make_float_weight_tensor(W, type);
+    if (!ggml_cuda_should_use_mmvf(q, d.cc, w.ne, w.nb, X.size(0)))
+      caps &= ~kDenseMmvf;
+    if (!ggml_cuda_should_use_mmf(q, d.cc, d.warp_size, w.ne, w.nb, X.size(0),
+                                  false))
+      caps &= ~kDenseMmf;
+  } else {
+    if (!ggml_cuda_should_use_mmvq(q, d.cc, X.size(0))) caps &= ~kDenseMmvq;
+    // Hard MMQ support was checked above. Use the plugin's common batch
+    // threshold instead of upstream's architecture-dependent BLAS crossover.
+    if (X.size(0) > gguf_dispatch::kDenseMmqMaxBatch) caps &= ~kDenseMmq;
+  }
+  return caps;
+}
+
+int64_t select_dense_method(const Tensor& W, const Tensor& X, int64_t type,
+                            int64_t row) {
+  const int64_t caps = dense_recommended_methods(W, X, type, row);
+  for (auto method :
+       {KernelMethod::Mmvf, KernelMethod::Mmf, KernelMethod::Mmvq,
+        KernelMethod::Mmq, KernelMethod::DequantizeBlas, KernelMethod::Blas}) {
+    if (caps & method_bit(method)) return method_bit(method);
+  }
+  // A recommendation cannot turn a runnable input into an unsupported one.
+  const int64_t supported = dense_supported_methods(W, X, type, row);
+  for (auto method : {KernelMethod::Mmvf, KernelMethod::Mmf, KernelMethod::Mmvq,
+                      KernelMethod::Mmq}) {
+    if (supported & method_bit(method)) return method_bit(method);
+  }
+  return 0;
+}
+
 Tensor run_selected_dense(const Tensor& W, const Tensor& X, int64_t type,
                           int64_t row, int64_t route, const char* op_name) {
-  if (route == kDenseMmvf || route == kDenseMmf) {
-    STD_TORCH_CHECK(float_type_matches(W, type) && row == W.size(0) &&
-                        W.size(1) == X.size(1) &&
-                        reinterpret_cast<uintptr_t>(W.data_ptr()) %
-                                (2 * W.element_size()) ==
-                            0,
-                    op_name, ": W type, row, K, or alignment mismatch");
+  // Private executor: both callers have already checked the selected route's
+  // hard constraints. Do not repeat the full capability query per expert.
+  if (route == kDenseMmvf || route == kDenseMmf)
     return run_upstream_float(W, X, type, row, route);
-  }
-  STD_TORCH_CHECK(
-      route == kDenseMmvq || route == kDenseMmq || route == kDenseBlas, op_name,
-      ": invalid kernel route ", route);
-  STD_TORCH_CHECK(is_upstream_weight_type(type) && W.element_size() == 1,
-                  op_name, ": expected a supported packed weight: ", type);
-  const int64_t k = logical_k_from_weight(W, type, op_name);
-  STD_TORCH_CHECK(X.size(1) == k, op_name, ": X K dimension mismatch");
-  if (route == kDenseMmvq) {
-    STD_TORCH_CHECK(X.size(0) <= MMVQ_MAX_BATCH_SIZE &&
-                        has_weight_padding(W, k, type, op_name),
-                    op_name, ": batch or weight padding invalid");
-    return run_upstream_mmvq(W, X, type, row, k);
-  }
-  if (route == kDenseMmq) {
-    STD_TORCH_CHECK(upstream_mmq_type_supported(type) &&
-                        has_weight_padding(W, k, type, op_name),
-                    op_name, ": type or weight padding invalid");
-    return run_upstream_mmq(W, X, type, row, k);
-  }
+  const int64_t k = is_upstream_float_type(type)
+                        ? W.size(1)
+                        : logical_k_from_weight(W, type, op_name);
+  if (route == kDenseMmvq) return run_upstream_mmvq(W, X, type, row, k);
+  if (route == kDenseMmq) return run_upstream_mmq(W, X, type, row, k);
   return run_upstream_blas(W, X, type, row, k);
 }
 
-Tensor run_explicit_dense(Tensor W, Tensor X, int64_t type, int64_t row,
-                          int64_t route, const char* name) {
+Tensor run_fixed_dense(Tensor W, Tensor X, int64_t type, int64_t row,
+                       int64_t route, const char* name) {
   check_dense_inputs(W, X, row, name);
+  STD_TORCH_CHECK(
+      route != 0 && (dense_supported_methods(W, X, type, row) & route), name,
+      ": method cannot run this type/shape/device/storage");
   if (X.size(0) == 0) {
     return torch::stable::new_empty(X, {0, row}, X.scalar_type());
   }
@@ -328,21 +324,45 @@ bool ggml_should_use_mmvq(int64_t type, int64_t cc, int64_t batch) {
 
 int64_t ggml_dense_upstream_capabilities(Tensor W, Tensor X, int64_t type,
                                          int64_t row) {
-  return upstream_dense_capabilities(W, X, type, row);
+  return dense_recommended_methods(W, X, type, row);
 }
 
 Tensor ggml_dense_mmvq(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_explicit_dense(W, X, type, row, kDenseMmvq, "ggml_dense_mmvq");
+  return run_fixed_dense(W, X, type, row, kDenseMmvq, "ggml_dense_mmvq");
 }
 Tensor ggml_dense_mmq(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_explicit_dense(W, X, type, row, kDenseMmq, "ggml_dense_mmq");
+  return run_fixed_dense(W, X, type, row, kDenseMmq, "ggml_dense_mmq");
 }
 Tensor ggml_dense_mmvf(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_explicit_dense(W, X, type, row, kDenseMmvf, "ggml_dense_mmvf");
+  return run_fixed_dense(W, X, type, row, kDenseMmvf, "ggml_dense_mmvf");
 }
 Tensor ggml_dense_mmf(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_explicit_dense(W, X, type, row, kDenseMmf, "ggml_dense_mmf");
+  return run_fixed_dense(W, X, type, row, kDenseMmf, "ggml_dense_mmf");
 }
 Tensor ggml_dense_blas(Tensor W, Tensor X, int64_t type, int64_t row) {
-  return run_explicit_dense(W, X, type, row, kDenseBlas, "ggml_dense_blas");
+  return run_fixed_dense(W, X, type, row, kDenseBlas, "ggml_dense_blas");
+}
+
+int64_t ggml_dense_supported_methods(Tensor W, Tensor X, int64_t type,
+                                     int64_t row) {
+  return dense_supported_methods(W, X, type, row);
+}
+int64_t ggml_dense_select_method(Tensor W, Tensor X, int64_t type,
+                                 int64_t row) {
+  return select_dense_method(W, X, type, row);
+}
+Tensor ggml_dense(Tensor W, Tensor X, int64_t type, int64_t row) {
+  check_dense_inputs(W, X, row, "ggml_dense");
+  const int64_t route = select_dense_method(W, X, type, row);
+  STD_TORCH_CHECK(
+      route != 0,
+      "ggml_dense: method cannot run this type/shape/device/storage");
+  if (X.size(0) == 0)
+    return torch::stable::new_empty(X, {0, row}, X.scalar_type());
+  return run_selected_dense(W, X, type, row, route, "ggml_dense");
+}
+Tensor ggml_dense_dequantize_blas(Tensor W, Tensor X, int64_t type,
+                                  int64_t row) {
+  return run_fixed_dense(W, X, type, row, kDenseDequantizeBlas,
+                         "ggml_dense_dequantize_blas");
 }

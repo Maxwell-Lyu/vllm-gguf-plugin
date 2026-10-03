@@ -24,11 +24,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
 from ..kernel_support import (
-    MOE_NOT_ELIGIBLE_MARKER,
     QuantizationBackend,
     QuantizationOperation,
     supports,
-    supports_moe,
 )
 from .params import (
     GGUFUninitializedWeightParameter,
@@ -38,7 +36,6 @@ from .params import (
     _materialize_upstream_moe_storage_padding,
     _store_gguf_weight_type,
 )
-from .utils import logger
 
 
 def _fused_moe_gguf(
@@ -64,120 +61,47 @@ def _fused_moe_gguf(
 
     out_hidden_states = torch.empty_like(x)
     moe_mode = ops.cuda_moe_kernel_mode()
-    upstream_types = supports_moe(
-        weight_type, QuantizationBackend.UPSTREAM
-    ) and supports_moe(weight_type2, QuantizationBackend.UPSTREAM)
-    upstream_available = (
-        upstream_types
-        and ops.cuda_moe_upstream_kernel_available(weight_type)
-        and ops.cuda_moe_upstream_kernel_available(weight_type2)
-    )
-    upstream_only_types = any(
-        supports_moe(quant_type, QuantizationBackend.UPSTREAM)
-        and not supports_moe(quant_type, QuantizationBackend.LEGACY)
-        and not supports_moe(quant_type, QuantizationBackend.TRITON)
-        for quant_type in (weight_type, weight_type2)
-    )
+    if moe_mode in {"upstream", "auto"}:
+        num_tokens = x.size(0)
+        top_k = topk_ids.size(1)
+        # Routing can be shared only for identical formats. Method decisions
+        # remain per projection, so W2 can still select grouped/another method.
+        alignment_cache = {} if weight_type == weight_type2 else None
+        out = ops.ggml_moe(
+            x,
+            w1,
+            topk_ids,
+            weight_type,
+            w1.size(1),
+            top_k,
+            num_tokens,
+            alignment_cache=alignment_cache,
+        )
+        out = act(out)
+        out = ops.ggml_moe(
+            out,
+            w2,
+            topk_ids.reshape(-1, 1),
+            weight_type2,
+            w2.size(1),
+            1,
+            num_tokens * top_k,
+            alignment_cache=alignment_cache,
+        )
+        out = out.reshape(num_tokens, top_k, w2.size(1)).mul_(
+            topk_weights.view(num_tokens, top_k, 1)
+        )
+        ops.moe_sum(out, out_hidden_states)
+        return out_hidden_states
 
-    def fallback_supports(quant_type: int, operation: QuantizationOperation) -> bool:
-        if moe_mode == "legacy":
-            return supports(quant_type, QuantizationBackend.LEGACY, operation)
-        if moe_mode == "triton":
-            return supports(quant_type, QuantizationBackend.TRITON, operation)
-        return supports(quant_type, QuantizationBackend.LEGACY, operation) or supports(
-            quant_type, QuantizationBackend.TRITON, operation
-        )
+    backend = QuantizationBackend(moe_mode)
 
-    if moe_mode == "upstream" and not upstream_available:
-        raise RuntimeError(
-            "upstream MoE CUDA kernel is unavailable for the selected "
-            "quantization types or build"
-        )
-    if moe_mode == "legacy" and upstream_only_types:
-        raise RuntimeError(
-            "legacy MoE mode cannot handle upstream-only quantization types"
-        )
-    if (
-        moe_mode in {"auto", "triton"}
-        and not upstream_available
-        and upstream_only_types
-    ):
-        raise RuntimeError(
-            "upstream-only quantization types require the upstream MoE CUDA "
-            "kernel; no legacy/Triton fallback is available"
-        )
-    if moe_mode == "triton" and not all(
-        fallback_supports(quant_type, QuantizationOperation.MMVQ)
-        or fallback_supports(quant_type, QuantizationOperation.MMQ)
-        for quant_type in (weight_type, weight_type2)
-    ):
-        raise RuntimeError(
-            "triton MoE backend is unavailable for the selected quantization types"
-        )
-    if moe_mode in {"upstream", "auto"} and upstream_available:
-        num_tokens, _ = x.shape
-        _, N, _ = w1.shape
-        top_k = topk_ids.shape[1]
-        try:
-            aligned = None
-            if (
-                num_tokens * top_k > 1024
-                and ops._cuda_moe_aligned_mmq_available(x, w1, weight_type)
-                and ops._cuda_moe_aligned_mmq_available(x, w2, weight_type2)
-            ):
-                aligned = moe_align_block_size(
-                    topk_ids, 16, w1.size(0), pad_sorted_ids=True
-                )
-
-            def project(inp, weight, ids, qtype, rows, top_k, tokens):
-                if aligned is None:
-                    return ops.ggml_moe_upstream(
-                        inp, weight, ids, qtype, rows, top_k, tokens
-                    )
-                return torch.ops._C_gguf.ggml_moe_mmq(
-                    inp,
-                    weight,
-                    aligned[0],
-                    qtype,
-                    rows,
-                    top_k,
-                    tokens,
-                    expert_ids=aligned[1],
-                    padded_count=aligned[2],
-                )
-
-            out = project(x, w1, topk_ids, weight_type, N, top_k, num_tokens)
-            out = act(out)
-            flat_topk_ids = topk_ids.reshape(-1, 1)
-            out = project(
-                out,
-                w2,
-                flat_topk_ids,
-                weight_type2,
-                w2.shape[1],
-                1,
-                num_tokens * top_k,
-            )
-            out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-                topk_weights.view(num_tokens, top_k, 1)
-            )
-            ops.moe_sum(out, out_hidden_states)
-            return out_hidden_states
-        except RuntimeError as error:
-            # The upstream op embeds MOE_NOT_ELIGIBLE_MARKER (defined in both
-            # kernel_support.py and runtime_moe.cu) when the inputs cannot run on
-            # the upstream MoE kernel; auto mode may then fall back.
-            if moe_mode != "auto" or MOE_NOT_ELIGIBLE_MARKER not in str(error):
-                raise
-            if upstream_only_types:
-                raise RuntimeError(
-                    "upstream-only quantization types cannot fall back from "
-                    "the upstream MoE CUDA kernel"
-                ) from error
+    def backend_supports(quant_type: int, operation: QuantizationOperation) -> bool:
+        return supports(quant_type, backend, operation)
 
     if (
-        fallback_supports(weight_type2, QuantizationOperation.MMQ)
-        and fallback_supports(weight_type, QuantizationOperation.MMQ)
+        backend_supports(weight_type2, QuantizationOperation.MMQ)
+        and backend_supports(weight_type, QuantizationOperation.MMQ)
         and x.shape[0] > 64
     ):
         num_tokens, _ = x.shape
@@ -200,6 +124,11 @@ def _fused_moe_gguf(
             num_tokens,
         )
         out = act(out)
+        if weight_type != weight_type2:
+            # A different format/backend can require a different route tile.
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, ops.ggml_moe_get_block_size(weight_type2), E
+            )
         out = ops.ggml_moe_a8(
             out,
             w2,
@@ -215,9 +144,9 @@ def _fused_moe_gguf(
             topk_weights.view(num_tokens, top_k, 1)
         )
         ops.moe_sum(out, out_hidden_states)
-    elif fallback_supports(
+    elif backend_supports(
         weight_type2, QuantizationOperation.MMVQ
-    ) and fallback_supports(weight_type, QuantizationOperation.MMVQ):
+    ) and backend_supports(weight_type, QuantizationOperation.MMVQ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
@@ -233,27 +162,7 @@ def _fused_moe_gguf(
         )
         ops.moe_sum(out, out_hidden_states)
     else:
-        from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
-
-        logger.warning_once(
-            "There is no support for fast MoE kernel "
-            "for current quantization method. "
-            "Falling back to slow implementation. "
-        )
-        for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
-            inp = x[tok].reshape((1,) + x.shape[1:])
-            current_hidden_state = None
-            for ww, ii in zip(w, idx):
-                out = fused_mul_mat_gguf_op(inp, w1[ii], weight_type)
-                out = act(out)
-                current_state = fused_mul_mat_gguf_op(out, w2[ii], weight_type2).mul_(
-                    ww
-                )
-                if current_hidden_state is None:
-                    current_hidden_state = current_state
-                else:
-                    current_hidden_state.add_(current_state)
-            out_hidden_states[tok] = current_hidden_state
+        raise RuntimeError(f"{moe_mode} MoE has no kernel for the selected types")
     return out_hidden_states
 
 

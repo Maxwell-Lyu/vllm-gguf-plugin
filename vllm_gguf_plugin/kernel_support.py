@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntFlag
 
 import gguf
 from gguf import GGMLQuantizationType as WeightType
@@ -20,6 +20,27 @@ class QuantizationOperation(str, Enum):
     MMQ = "mmq"
     MMVF = "mmvf"
     MMF = "mmf"
+    BLAS = "blas"
+    DEQUANTIZE_BLAS = "dequantize_blas"
+    GROUPED_DENSE = "grouped_dense"
+    MMQ_ALIGNED = "mmq_aligned"
+
+
+class KernelMethod(IntFlag):
+    """Method bits shared with csrc/upstream/kernel_dispatch.cuh.
+
+    This enum does not select a backend.
+    """
+
+    NONE = 0
+    MMVF = 1
+    MMF = 2
+    MMVQ = 4
+    MMQ = 8
+    DEQUANTIZE_BLAS = 16
+    BLAS = 32
+    GROUPED_DENSE = 64
+    MMQ_ALIGNED = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,12 +57,19 @@ class QuantizationSupport:
         return operation in getattr(self, backend.value)
 
 
-def _types(*names: str) -> tuple[WeightType, ...]:
-    """Resolve optional GGUF Python enum members in one place."""
+# The pinned GGML ABI includes Q2_0 even when gguf-python has no enum member.
+GGML_TYPE_Q2_0 = 42
+_GGML_FALLBACK_TYPES = {"Q2_0": GGML_TYPE_Q2_0}
+_GGML_FALLBACK_SIZES = {GGML_TYPE_Q2_0: (64, 18)}
+
+
+def _types(*names: str) -> tuple[int, ...]:
+    """Resolve GGML IDs independently of optional gguf-python enum members."""
     return tuple(
         value
         for name in names
-        if (value := getattr(WeightType, name, None)) is not None
+        if (value := getattr(WeightType, name, _GGML_FALLBACK_TYPES.get(name)))
+        is not None
     )
 
 
@@ -66,13 +94,23 @@ _LEGACY_ALL = (
 _UPSTREAM_DEQUANT_MMVQ = (
     QuantizationOperation.DEQUANTIZE,
     QuantizationOperation.MMVQ,
+    QuantizationOperation.DEQUANTIZE_BLAS,
+    QuantizationOperation.GROUPED_DENSE,
 )
 _UPSTREAM_ALL = (
     QuantizationOperation.DEQUANTIZE,
     QuantizationOperation.MMVQ,
     QuantizationOperation.MMQ,
+    QuantizationOperation.MMQ_ALIGNED,
+    QuantizationOperation.DEQUANTIZE_BLAS,
+    QuantizationOperation.GROUPED_DENSE,
 )
-_UPSTREAM_FLOAT = (QuantizationOperation.MMVF, QuantizationOperation.MMF)
+_UPSTREAM_FLOAT = (
+    QuantizationOperation.MMVF,
+    QuantizationOperation.MMF,
+    QuantizationOperation.BLAS,
+    QuantizationOperation.GROUPED_DENSE,
+)
 
 
 def _support(
@@ -115,10 +153,10 @@ _IQ_TYPES = _types(
 )
 _UPSTREAM_EXTRA_TYPES = _types("Q1_0", "Q2_0", "MXFP4", "NVFP4")
 
-_SUPPORT: dict[WeightType, QuantizationSupport] = {}
+_SUPPORT: dict[int, QuantizationSupport] = {}
 
 
-def _register(types: Iterable[WeightType], support: QuantizationSupport) -> None:
+def _register(types: Iterable[int], support: QuantizationSupport) -> None:
     for weight_type in types:
         if weight_type in _SUPPORT:
             raise AssertionError(f"duplicate support row for {weight_type}")
@@ -176,7 +214,7 @@ _register(_UPSTREAM_EXTRA_TYPES, _support(upstream=_UPSTREAM_ALL))
 
 def get_quantization_support(weight_type: int) -> QuantizationSupport:
     try:
-        return _SUPPORT.get(WeightType(weight_type), QuantizationSupport())
+        return _SUPPORT.get(int(weight_type), QuantizationSupport())
     except (TypeError, ValueError):
         return QuantizationSupport()
 
@@ -205,7 +243,7 @@ def supports_moe(weight_type: int, backend: QuantizationBackend) -> bool:
 
 def _types_for(
     backend: QuantizationBackend, operation: QuantizationOperation
-) -> frozenset[WeightType]:
+) -> frozenset[int]:
     return frozenset(
         weight_type
         for weight_type, support in _SUPPORT.items()
@@ -253,10 +291,7 @@ _UPSTREAM_STORAGE_TYPES = CUDA_UPSTREAM_MMVQ_TYPES | CUDA_UPSTREAM_MMQ_TYPES
 # static-asserts the C++ side stays a multiple of this value.
 _MATRIX_ROW_PADDING = 512
 
-# Stable error-message marker emitted by csrc/upstream/runtime_moe.cu whenever the
-# upstream MoE kernel cannot run its inputs. fused_moe.py matches on this to
-# decide whether auto mode may fall back to the legacy/Triton MoE path. Both
-# sides must change together.
+# Stable error marker for unsupported upstream MoE inputs; never enables fallback.
 MOE_NOT_ELIGIBLE_MARKER = "VLLM_GGUF_MOE_NOT_ELIGIBLE"
 
 
@@ -264,7 +299,10 @@ def upstream_storage_padding_bytes(weight_type: int, packed_row_size: int) -> in
     """Return the extra byte storage required by upstream dense CUDA kernels."""
     if weight_type not in _UPSTREAM_STORAGE_TYPES or packed_row_size <= 0:
         return 0
-    block_size, type_size = gguf.GGML_QUANT_SIZES[WeightType(weight_type)]
+    if weight_type in _GGML_FALLBACK_SIZES:
+        block_size, type_size = _GGML_FALLBACK_SIZES[weight_type]
+    else:
+        block_size, type_size = gguf.GGML_QUANT_SIZES[WeightType(weight_type)]
     if packed_row_size % type_size:
         return 0
     logical_k = packed_row_size // type_size * block_size

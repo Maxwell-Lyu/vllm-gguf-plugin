@@ -13,8 +13,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from .. import ops
 from ..kernel_support import (
     QuantizationBackend,
-    QuantizationOperation,
-    supports,
     supports_moe,
     upstream_storage_padding_bytes,
 )
@@ -42,32 +40,11 @@ def _fused_mul_mat_gguf(
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
-    upstream_enabled = ops.cuda_dense_upstream_enabled()
+    mode = ops.cuda_dense_kernel_mode()
+    if mode in {"auto", "upstream"}:
+        return ops.ggml_dense(weight, x, weight_type, weight.shape[0])
     if weight_type in UNQUANTIZED_TYPES:
-        if upstream_enabled:
-            caps = ops.dense_upstream_capabilities(
-                weight, x, weight_type, weight.shape[0]
-            )
-            if caps & ops.DENSE_MMVF:
-                return ops.ggml_dense_mmvf(weight, x, weight_type, weight.shape[0])
-            if caps & ops.DENSE_MMF:
-                return ops.ggml_dense_mmf(weight, x, weight_type, weight.shape[0])
         return x @ weight.T
-
-    upstream_matmul = upstream_enabled and supports(
-        weight_type, QuantizationBackend.UPSTREAM, QuantizationOperation.DEQUANTIZE
-    )
-    if upstream_matmul:
-        caps = ops.dense_upstream_capabilities(weight, x, weight_type, weight.shape[0])
-        if caps & ops.DENSE_MMVQ:
-            return ops.ggml_dense_mmvq(weight, x, weight_type, weight.shape[0])
-        if caps & ops.DENSE_MMQ:
-            return ops.ggml_dense_mmq(weight, x, weight_type, weight.shape[0])
-        if caps & ops.DENSE_BLAS:
-            return ops.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
-        raise RuntimeError(
-            f"No upstream dense kernel for quantization type {weight_type}"
-        )
 
     if weight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if weight.shape[0] > 5120 else 16

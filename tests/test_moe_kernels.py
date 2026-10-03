@@ -33,8 +33,9 @@ IQ_TYPES = (Q.IQ2_XXS, Q.IQ2_S, Q.IQ3_S, Q.IQ3_XXS, Q.IQ4_XS)
     ],
 )
 def test_float_moe_weights_match_runtime_dtype_and_type(
-    params_dtype: torch.dtype, expected_type: Q
+    params_dtype: torch.dtype, expected_type: Q, monkeypatch
 ):
+    monkeypatch.setenv("VLLM_GGUF_CUDA_DENSE_KERNEL", "legacy")
     layer = torch.nn.Module()
     layer.moe_config = SimpleNamespace(moe_parallel_config=SimpleNamespace(tp_size=1))
 
@@ -141,14 +142,16 @@ def test_fused_moe_reuses_aligned_plan(monkeypatch, types, dtype):
         activities=[torch.profiler.ProfilerActivity.CPU]
     ) as profile:
         output = run()
-    assert len(plans) == 1
-    assert sum(e.name == "_C_gguf::ggml_moe_mmq" for e in profile.events()) == 2
+    same_type = types[0] == types[1]
+    assert len(plans) == (1 if same_type else 2)
+    expected_op = "_C_gguf::ggml_moe_mmq_aligned"
+    assert sum(e.name == expected_op for e in profile.events()) == 2
     check(output)
     plans.clear()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run()
-    assert len(plans) == 1
+    assert len(plans) == (1 if same_type else 2)
     ids.copy_((ids + 2) % experts)
     x.mul_(0.5)
     graph.replay()
@@ -193,6 +196,23 @@ def _check_mmq_dynamic_routes(experts, row, top_k, dtype, k=256):
     ids.copy_((experts - top_k + offsets).expand_as(ids))
 
     def run():
+        if experts <= 992:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                moe_align_block_size,
+            )
+
+            plan = moe_align_block_size(ids, 16, experts, pad_sorted_ids=True)
+            return ops.ggml_moe_mmq_aligned(
+                x,
+                weight,
+                plan[0],
+                int(Q.Q8_0),
+                row,
+                top_k,
+                tokens,
+                expert_ids=plan[1],
+                padded_count=plan[2],
+            )
         return ops.ggml_moe_mmq(x, weight, ids, int(Q.Q8_0), row, top_k, tokens)
 
     def check(output):
@@ -274,7 +294,7 @@ def test_moe_explicit_kernel_reference_and_graph(kernel, tokens):
     graph = torch.cuda.CUDAGraph()
     if kernel == "grouped_dense":
         with (
-            pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"),
+            pytest.raises(RuntimeError, match="requested MoE method cannot run"),
             torch.cuda.graph(graph),
         ):
             op(*args)
@@ -290,11 +310,9 @@ def test_moe_explicit_kernel_reference_and_graph(kernel, tokens):
 @pytest.mark.parametrize(
     "kernel,quant_type,tokens,message",
     [
-        ("mmvq", Q.F16, 8, "requires quantized weights"),
-        ("mmq", Q.F16, 8, "requires quantized weights"),
-        ("mmq", Q.IQ1_M, 8, "MMQ does not support"),
-        ("mmq", Q.Q8_0, 7, "MMQ does not support"),
-        ("grouped_dense", Q.F16, 8, "grouped dense does not support"),
+        ("mmvq", Q.F16, 8, "requested MoE method cannot run"),
+        ("mmq", Q.F16, 8, "requested MoE method cannot run"),
+        ("mmq", Q.IQ1_M, 8, "requested MoE method cannot run"),
     ],
 )
 def test_moe_explicit_kernel_rejects_unsupported(kernel, quant_type, tokens, message):
@@ -380,7 +398,7 @@ def test_moe_mmq_shared_plan_contract(invalid):
     else:
         count = count.expand(2).contiguous()
     with pytest.raises(RuntimeError, match="VLLM_GGUF_MOE_NOT_ELIGIBLE"):
-        torch.ops._C_gguf.ggml_moe_mmq(
+        torch.ops._C_gguf.ggml_moe_mmq_aligned(
             x,
             weight,
             routes,
@@ -454,7 +472,7 @@ def test_moe_float_mmvf_mmf_reference(dtype, quant_type, atol, route, tokens):
             from vllm_gguf_plugin.kernel_support import MOE_NOT_ELIGIBLE_MARKER
 
             with pytest.raises(RuntimeError, match=MOE_NOT_ELIGIBLE_MARKER):
-                torch.ops._C_gguf.ggml_moe_upstream(
+                torch.ops._C_gguf.ggml_moe_mmf(
                     x, weight, ids, int(quant_type), rows, top_k, tokens
                 )
             return
@@ -569,22 +587,30 @@ def test_moe_float_chunked_mmf_reference_and_graph(rows, tokens, top_k):
 
 @cuda_mark
 @torch.inference_mode()
-def test_moe_float_without_mmf_returns_eligibility_marker():
-    import vllm_gguf_plugin._C_gguf  # noqa: F401
+def test_moe_float_without_mmf_uses_blas_and_rejects_graph():
+    from vllm_gguf_plugin import ops
+    from vllm_gguf_plugin.kernel_support import KernelMethod
 
-    from vllm_gguf_plugin.kernel_support import MOE_NOT_ELIGIBLE_MARKER
-
-    # Odd K blocks MMVF; 63 rows blocks MMF. No host-sync fallback is used.
-    x = torch.zeros((17, 255), device="cuda", dtype=torch.float16)
-    weight = torch.zeros((2, 63, 255), device="cuda", dtype=torch.float16)
+    x = torch.randn((17, 255), device="cuda", dtype=torch.float16) * 0.1
+    weight = torch.randn((2, 63, 255), device="cuda", dtype=torch.float16) * 0.1
     ids = torch.zeros((17, 1), device="cuda", dtype=torch.int32)
-    with pytest.raises(RuntimeError, match=MOE_NOT_ELIGIBLE_MARKER):
-        torch.ops._C_gguf.ggml_moe_upstream(x, weight, ids, int(Q.F16), 63, 1, 17)
+    args = (x, weight, ids, int(Q.F16), 63, 1, 17)
+    assert ops.moe_supported_methods(*args) == (
+        KernelMethod.BLAS | KernelMethod.GROUPED_DENSE
+    )
+    torch.testing.assert_close(
+        ops.ggml_moe(*args), x @ weight[0].T, atol=0.002, rtol=0.02
+    )
+    with (
+        pytest.raises(RuntimeError, match="VLLM_GGUF_MOE_NOT_ELIGIBLE"),
+        torch.cuda.graph(torch.cuda.CUDAGraph()),
+    ):
+        ops.ggml_moe(*args)
 
 
 @cuda_mark
 @torch.inference_mode()
-def test_moe_float_auto_ineligible_rejects_slow_fallback(monkeypatch):
+def test_moe_float_auto_uses_upstream_blas(monkeypatch):
     from vllm_gguf_plugin.quantization.fused_moe import _fused_moe_gguf
 
     monkeypatch.setenv("VLLM_GGUF_CUDA_MOE_KERNEL", "auto")
@@ -593,10 +619,10 @@ def test_moe_float_auto_ineligible_rejects_slow_fallback(monkeypatch):
     w2 = torch.zeros((2, 255, 32), device="cuda", dtype=torch.float16)
     ids = torch.tensor([[0, 1]] * 17, device="cuda", dtype=torch.int32)
     topk_weights = torch.full((17, 2), 0.5, device="cuda", dtype=torch.float16)
-    with pytest.raises(
-        RuntimeError, match="upstream-only quantization types cannot fall back"
-    ):
-        _fused_moe_gguf(x, w1, w2, topk_weights, ids, int(Q.F16), int(Q.F16), "silu")
+    actual = _fused_moe_gguf(
+        x, w1, w2, topk_weights, ids, int(Q.F16), int(Q.F16), "silu"
+    )
+    torch.testing.assert_close(actual, torch.zeros_like(x))
 
 
 @cuda_mark
@@ -705,7 +731,10 @@ def test_moe_template_instance_types(monkeypatch):
 
 @cuda_mark
 @torch.inference_mode()
-@pytest.mark.parametrize("tokens,top_k", [(128, 8), (129, 8), (1024, 1), (1025, 1)])
+@pytest.mark.parametrize(
+    "tokens,top_k",
+    [(32, 8), (33, 8), (256, 1), (257, 1), (128, 8), (129, 8), (1024, 1), (1025, 1)],
+)
 def test_moe_graph_at_route_count_boundary(monkeypatch, tokens, top_k):
     import vllm_gguf_plugin._C_gguf  # noqa: F401
 
